@@ -1,0 +1,684 @@
+#!/usr/bin/perl
+
+use 5.008;
+use strict;
+use warnings;
+use re 'taint';
+no warnings 'uninitialized';
+
+use Data::Dumper;
+
+my $re_QID     = qr/[a-z\d]+/;
+my $re_IP_strict = qr/\b(25[0-5]|2[0-4]\d|[01]?\d{1,2})\.(25[0-5]|2[0-4]\d|[01]?\d{1,2})\.(25[0-5]|2[0-4]\d|[01]?\d{1,2})\.(25[0-5]|2[0-4]\d|[01]?\d{1,2})\b/;
+
+my ( %Opts, %Queue, %Totals, %Counts, %Unmatched );
+
+# Default values for various options.  These are used
+# to reset default values after an option has been
+# disabled (via undef'ing its value).  This allows
+# a report to be disabled via config file or --nodetail,
+# but reenabled via subsequent command line option
+my %Defaults = (
+   detail                      => 10,                        # report level detail
+   syslog_name                 => 'smtpd',                   # service name (postconf(5), syslog_name)
+   delays                      => 1,                         # show message delivery delays report
+   smtpctl_path                => '/usr/sbin/smtpctl',       # path to smtpctl binary
+   geoip_path                  => '/usr/bin/geoiplookup',    # path to geoiplookup binary
+   subaddress_delimiter        => '+',                       # delimiter used for subaddress extension
+   subaddress_strip            => 0,                         # strip the subaddress extension for cleaner logs
+   ignore_local                => 0                          # ignore lines from/to localhost (if mail is relayed through Amavisd etc)
+);
+
+#
+# Initialize options to defaults or to those defined in the config file.
+#
+$Opts{detail} = $ENV{LOGWATCH_DETAIL_LEVEL} || $Defaults{detail};
+
+map { $Opts{$_} = $ENV{$_} || $Defaults{$_} unless exists $Opts{$_} } keys %Defaults;
+
+my $origline;
+
+sub unmatched() {
+   $Unmatched{$origline}++;
+}
+
+#
+# Unitize a number, and return appropriate printf formatting string
+#
+sub unitize($$) {
+   my ( $fmt, $num ) = @_;
+   my $kilobyte = 2**10;
+   my $megabyte = 2**20;
+   my $gigabyte = 2**30;
+   my $terabyte = 2**40;
+
+   if( $num >= $terabyte ) {
+      $num /= $terabyte;
+      $fmt .= '.3fT';
+   } elsif( $num >= $gigabyte ) {
+      $num /= $gigabyte;
+      $fmt .= '.3fG';
+   } elsif( $num >= $megabyte ) {
+      $num /= $megabyte;
+      $fmt .= '.3fM';
+   } elsif( $num >= $kilobyte ) {
+      $num /= $kilobyte;
+      $fmt .= '.3fK';
+   } else {
+      $fmt .= 'd ';
+   }
+
+   return ( $fmt, $num );
+}
+
+sub line ($$) {
+   my ( $num, $text ) = @_;
+
+   my $unit = ( $num =~ s/([a-z]|[A-Z]{1})$//o ) ? $1 : ' ';
+
+   return sprintf("%10s%s  %s\n", $num || 0, $unit, $text );
+}
+
+#
+# Strip delimiter from e-mail addresses.
+#
+sub strip_delimiter {
+   if( $Opts{subaddress_strip} ) {
+      for ( @_ ) {
+         s/\Q$Opts{subaddress_delimiter}\E(\S+)@/@/o;
+      }
+   }
+}
+
+sub duration_to_seconds ($) {
+   my $delay = shift;
+   my $seconds = 0;
+
+   if( $delay =~ /(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)/o ) {
+      $seconds = ( ( $1 || 0 ) * 24 * 60 * 60 ) + ( ( $2 || 0 ) * 60 * 60 ) + ( ( $3 || 0 ) * 60 ) + ( $4 || 0 );
+   }
+
+   return int($seconds);
+}
+
+sub duration_to_text ($) {
+   my $t = shift;
+   my ( $s, $m, $h, $d );
+
+   return '0s' if( $t == 0 );
+
+   $s = $t % 60;
+   $t /= 60;
+   $m = $t % 60;
+   $t /= 60;
+   $h = $t % 24;
+   $d = int( $t / 24 );
+
+   my $ret = '';
+
+   $ret .= $d.'d' if( $d );
+   $ret .= $h.'h' if( $h );
+   $ret .= $m.'m' if( $m );
+   $ret .= $s.'s' if( $s );
+
+   return $ret;
+
+}
+
+#
+# Main processing loop
+#
+LINE: while ( <> ) {
+   chomp;
+   s/\s+$//;
+
+   next unless length $_;
+
+   next unless /^[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} ?(\S+) $Opts{syslog_name}(?:\[\d+\]): ?((?:(\S+):)?.*)$/o;
+
+   my ( $mailhost, $p1, $service_name ) = ( $1, $2, $3 );
+
+   next if $service_name =~ /^(debug|imsg|io|smtp|filters|transfer|bounce|scheduler|expand|lookup|stat|rules|mproc|ramstat|smtp-out|queue-backend|mda|control)/o;
+
+   $origline = $_;
+
+#   print "mailhost: $mailhost, servicename: $service_name, p1: $p1\n";
+
+   if( $service_name eq 'info') {
+      if( $p1 =~ /OpenSMTPD (?:.*) starting$/o ) {
+         $Totals{opensmtpdstart}++;
+      } else {
+         # Feb 15 13:07:42 localhost smtpd[92673]: info: Table "aliases" successfully updated
+         $p1 =~ s/^info:\s+//;
+         $Counts{info}{$p1}++;
+      }
+   }
+
+   elsif( $service_name eq '' && ( $p1 eq 'Exiting') ) {
+       $Totals{opensmtpdexit}++;
+   }
+
+   # Feb 15 13:07:14 localhost smtpd[92675]: delivery: Remove for 56bde0d3348d0ccb: from=<sender@domain.com>, to=<recipient@domain.com>, rcpt=<->, delay=19m54s, stat=Removed by administrator
+   elsif( $service_name eq 'delivery' and ( $p1 =~ /Remove for (?:$re_QID): from=<(?:\S*)>, to=<(?:\S*)>, rcpt=<(?:\S*)>, delay=(?:\S*), stat=(.*)/o ) ) {
+       $Totals{removed}++;
+   }
+
+   # Feb 15 13:50:31 localhost smtpd[93928]: warn: queue: no return path!
+   elsif( $service_name eq 'warn') {
+       $p1 =~ s/^warn:\s+//;
+       $Totals{warnings}++;
+       $Counts{warnings}{$p1}++;
+   }
+
+   elsif( $p1 =~ /^($re_QID) (smtp|mta|mda) event=(\S+)/o ) {
+      my ( $qid, $protocol, $event ) = ( $1, $2, $3 );
+
+#      print "qid: $qid protocol: $protocol event: $event\n";
+
+      if( $protocol eq 'smtp') {
+         # Feb 16 12:34:26 localhost smtpd[1180]: 9db5bf49cce33ff4 smtp event=connected address=192.168.1.3 host=host.domain.com
+         if( $event eq 'connected' and ( $p1 =~ /address=(\S+) host=(?:\S+)/o ) ) {
+            next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
+            $Totals{SMTP}{connections}++;
+         }
+
+         # Feb 22 12:07:26 localhost smtpd[1196]: 8ae9b04ef67317c9 smtp event=closed address=192.168.1.100 host=host.domain.com reason=quit
+         elsif( $event eq 'closed' and ( $p1 =~ /address=(\S+) host=(?:\S+)/o ) ) {
+            next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
+            $Totals{SMTP}{disconnections}++;
+         }
+
+         # Feb 16 01:22:51 localhost smtpd[98613]: 7903c23b6f7322bf smtp event=starttls address=10.0.8.2 host=10.0.8.2 ciphers="version=TLSv1.2, cipher=ECDHE-RSA-AES256-GCM-SHA384, bits=256"
+         elsif( $event eq 'starttls') {
+            next;
+         }
+
+         # Feb 16 12:18:41 localhost smtpd[100401]: c313604f7684f2ef smtp event=authentication user=sender@domain.com address=192.168.1.100 host=host.domain.com result=ok
+         # Feb 22 12:06:45 localhost smtpd[1196]:   8ae9b04ef67317c9 smtp event=authentication user=sender@domain.com address=192.168.1.100 host=host.domain.com result=permfail
+         elsif( $event eq 'authentication' and ($p1 =~ /user=(\S+) address=(\S+) host=(?:\S+) result=(\S+)/o ) ) {
+            my ( $user, $hostip, $result ) = ( lc($1), $2, $3 );
+
+            if( $result eq 'ok') {
+               $Totals{SMTP}{auth}{success}++;
+               $Counts{SMTP}{auth}{success}{$user}++;
+            }
+
+            elsif( $result eq 'permfail' or $result eq 'tempfail') {
+               $Totals{SMTP}{auth}{failure}++;
+               $Counts{SMTP}{auth}{failure}{$hostip}{$user}++;
+            }
+
+            else {
+               unmatched();
+               next;
+            }
+         }
+
+         # Feb 16 12:21:37 localhost smtpd[100401]: c313606ebd5ef9cc smtp event=message address=local host=host.domain.com msgid=9c5ede28 from=<> to=<recipient@domain.com> size=15676 ndest=1 proto=ESMTP
+         elsif( $event eq 'message' and ( $p1 =~ /address=(\S+) host=(\S+) msgid=($re_QID) from=<(\S*)> to=<(\S+)> size=(\d+)/o ) ) {
+            my ( $hostip, $host, $qid, $from, $to, $size ) = ( $1, $2, $3, lc($4) || '-', lc($5), $6 || 0 );
+
+            $Queue{$qid} = $size;
+
+            next if ( $Opts{ignore_local} and $hostip eq '127.0.0.1');
+
+            strip_delimiter( $from, $to );
+
+            $Totals{SMTP}{messages}++;
+            $Totals{SMTP}{bytes} += $size;
+
+            $Counts{SMTP}{hosts}{"$hostip ($host)"}++;
+            $Counts{SMTP}{senders}{$from}++;
+            $Counts{SMTP}{recipients}{$to}++;
+         }
+
+         # Feb 16 11:59:04 localhost smtpd[100157]: 264a4f5e3d18409d smtp event=failed-command address=127.0.0.1 host=localhost command="RCPT TO:<root@domain.com>" result="550 Invalid recipient"
+         # Feb 22 12:06:45 localhost smtpd[1196]  : 8ae9b04ef67317c9 smtp event=failed-command address=192.168.1.100 host=host.domain.com command="AUTH LOGIN (password)" result="535 Authentication failed"
+         # Feb 14 13:18:37 localhost smtpd[80916]: 0bde80208e1d3799 smtp event=bad-input address=192.168.1.100 host=host.domain.com result="500 5.5.1 Invalid command: Pipelining not supported"
+         elsif( ( $event eq 'failed-command' and ( $p1 =~ /address=(\S+) host=(?:\S+) command="(.*?)" result="(.*?)"/o ) ) or
+            ( $event eq 'bad-input' and ( $p1 =~ /address=(\S+) host=(?:\S+) (?:(.*?))result="(.*?)"/o ) ) ) {
+            my ( $hostip, $command, $result ) = ( $1, $2, $3 );
+
+            next if ( $Opts{ignore_local} and $hostip eq '127.0.0.1');
+
+            # Ignore authentication failures.
+            # We already took care of these above.
+            #
+            next if( $result =~ /^535 /);
+
+            $Totals{SMTP}{failure}++;
+            $Counts{SMTP}{failure}{$result}{$1}++;
+         }
+
+         else {
+            unmatched();
+            next;
+         }
+      }
+
+      elsif( $protocol eq 'mta') {
+         # Feb 16 12:28:32 localhost smtpd[100401]: c313609bf8bf22f1 mta event=connecting address=lmtp://127.0.0.1:10026 host=localhost
+         # Feb 16 12:28:32 localhost smtpd[100401]: c313609f83342aca mta event=connecting address=tls://192.168.1.3:25 host=host.domain.com
+         # Feb 16 00:50:21 localhost smtpd[98310] : 8cff1f9df20f086f mta event=starttls ciphers=version=TLSv1, cipher=DHE-RSA-AES256-SHA, bits=256
+         # Feb 21 12:44:43 localhost smtpd[1196]  : 8ae9b04554cbb3de mta event=connected
+         # Feb 16 12:28:42 localhost smtpd[100401]: c313609bf8bf22f1 mta event=closed reason=quit messages=1
+         # Mar  2 16:30:30 localhost smtpd[1167]  : 6b45940959e04219 mta event=error reason=IO Error: Connection refused
+         next if $event =~ /^(connecting|starttls|connected|closed|error$)/o;
+
+         # Feb 21 12:44:47 localhost smtpd[1196]  : 8ae9b049c19e0ca4 mta event=delivery evpid=9eac896b26f98149 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="192.168.1.4" relay="192.168.1.3 (host.domain.com)" delay=1s result="Ok" stat="250 ok 1519209887 qp 14505"
+         # Feb 21 12:44:47 localhost smtpd[1196]  : 8ae9b04554cbb3de mta event=delivery evpid=99db4828284334fd from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="127.0.0.1" relay="127.0.0.1 (localhost)" delay=4s result="Ok" stat="250 2.0.0 from MTA(smtp:[127.0.0.1]:10027): 250 2.0.0: 9eac896b Message accepted for delivery"
+         # Feb 16 11:59:05 localhost smtpd[100157]: 264a4f5d1ddad477 mta event=delivery evpid=a5a96f9a72644038 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="127.0.0.1" relay="127.0.0.1 (localhost)" delay=4s result="PermFail" stat="550 5.1.0 id=98534-03 - Rejected by next-hop MTA on relaying, from MTA(smtp:[127.0.0.1]:10025): 550 Invalid recipient"
+         # Mar  2 16:30:41 localhost smtpd[1167]  : 0000000000000000 mta event=delivery evpid=be24f5b86bc1b7f4 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="-" relay="127.0.0.1" delay=11s result="TempFail" stat="Network error on destination MXs"
+         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> rcpt=<(\S+)> source="(\S+)" relay="(\S+)(?:\s\((\S+)\))?" delay=(\S+) result="(\S+)" stat="(.*?)"/o ) ) {
+            my ( $qid, $from, $to, $origto, $source, $relayhostip, $relayhost, $delay, $result, $status ) = ( ( substr $1, 0, 8 ), lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8, $9, $10 );
+
+            # Always display failed local transfers.
+            #
+            next if ( $Opts{ignore_local} and $relayhostip eq '127.0.0.1' and $result eq 'Ok');
+
+            my $destination = ( $relayhostip eq '127.0.0.1') ? 'local' : 'remote';
+            my $size = $Queue{$qid};
+
+            $Totals{MTA}{$destination}{messages}++;
+            $Counts{MTA}{$destination}{hosts}{"$relayhostip ($relayhost)"}++ if( $destination eq 'remote');
+
+            # print "from: $from, to: $to, rcpt: $origto, src: $source, relay: $relayhostip ($relayhost) delay: $delay"."s, result: $result\nstat: $status\n";
+
+            if( $result eq 'Ok') {
+
+               $Totals{MTA}{$destination}{success}++;
+               $Totals{MTA}{$destination}{bytes} += $size;
+
+               $delay = duration_to_seconds($delay);
+
+               $Totals{MTA}{$destination}{delay} = $delay unless $Totals{MTA}{$destination}{delay} and $Totals{MTA}{$destination}{delay} gt $delay;
+
+               strip_delimiter( $from, $to );
+
+               $Counts{MTA}{$destination}{recipients}{$to}{messages}++;
+               $Counts{MTA}{$destination}{recipients}{$to}{bytes} += $size;
+
+            }
+
+            else {
+               $Totals{MTA}{$destination}{failure}++;
+               $Counts{MTA}{$destination}{failure}{ ( $status =~ /^(\d{3} \d+.\d+.\d+) (?:.*?)$/o ) ? $1 : $status }{$to}++;
+            }
+         }
+
+         else {
+            unmatched();
+            next;
+         }
+      }
+
+      elsif( $protocol eq 'mda') {
+         # Feb 22 23:43:47 localhost smtpd[1170]  : 0000000000000000 mda event=delivery evpid=2abff8b46a5614cd from=<sender@domain.com> to=<recipient@domain.com> user=recipient_domain.com method=lmtp delay=0s result=Ok stat=Delivered
+         # Feb 16 12:23:16 localhost smtpd[100401]: 0000000000000000 mda event=delivery evpid=5073be8a28fc935a from=<sender@domain.com> to=<recipient@domain.com> user=recipient_comain.com method=mda delay=0s result=Ok stat=Delivered
+         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> (?:rcpt=<(.*?)>,)?(?:.*) method=(\S+) delay=(\S+) result=(\S+) stat=(.+)/o )) {
+            my ( $qid, $from, $to, $origto, $method, $delay, $result, $status ) = ( substr( $1, 0, 8 ), lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8 );
+
+            # print "from: $from to: $to rcpt: $origto method: $method delay: ".$delay."s result: $result status: $status\n";
+
+            my $size = $Queue{$qid};
+
+            strip_delimiter( $from, $to );
+
+            if( $result eq 'Ok') {
+               $Totals{MDA}{$method}{success}++;
+               $Totals{MDA}{$method}{bytes} += $size;
+               $Counts{MDA}{$method}{success}{$to}{messages}++;
+               $Counts{MDA}{$method}{success}{$to}{bytes} += $size;
+            } else {
+               $Totals{MDA}{$method}{failure}++;
+               $Counts{MDA}{$method}{failure}{$status}{$to}++;
+            }
+
+            $delay = duration_to_seconds($delay);
+
+            $Totals{MDA}{$method}{delay} = $delay unless $Totals{MDA}{$method}{delay} and $Totals{MDA}{$method}{delay} gt $delay;
+
+         } else {
+            unmatched();
+            next;
+         }
+      }
+
+      else {
+         unmatched();
+         next;
+      }
+   }
+
+   else {
+      next if $p1 =~ /^pony express:/;
+      unmatched();
+      next;
+   }
+
+}
+
+sub center($;$;$) {
+   my ( $text, $padding, $width )  = @_;
+   $width = 75 unless $width;
+   $padding = ( $padding || ' ') x int( ( $width - length $text ) / 2 - 1 );
+   return sprintf "%s %s %s\n", $padding, $text, $padding;
+}
+
+sub geoip($$$) {
+   my ( $bin, $dat, $ip ) = @_;
+
+   return $ip unless $bin and $dat;
+
+   chomp( my $country = `$bin -f $dat "$ip" | cut -d':' -f2-`);
+
+   return ( $country =~ /(\S+), (.*)/o ) ? sprintf "%s [%s, %s]", $ip, $1, $2 : $ip;
+}
+
+sub print_summary() {
+   my ( $var, @ret );
+
+   print line( $var, "OpenSMTPD started") if ( ( $var = delete $Totals{opensmtpdstart} ) > 0 );
+   print line( $var, "OpenSMTPD exited") if ( ( $var = delete $Totals{opensmtpdexit} ) > 0 );
+
+   # Print the mail queue.
+   my $smtpctl = $ENV{smtpctl_path} || $Opts{smtpctl_path};
+
+   if( -x $smtpctl ) {
+      chomp( my $num = `$smtpctl show queue | wc -l`);
+      print line( $num, "Queued messages") if( $num > 0 );
+   } else {
+      print "*** Unable to access message queue: smtpctl not in $smtpctl ***\n";
+   }
+
+   if( $Totals{removed} ) {
+      print line( delete $Totals{removed}, "Removed messages");
+   }
+
+   if( $Totals{warnings} ) {
+      print line( delete $Totals{warnings}, "Warnings");
+   }
+
+   my ( $geoip_bin, $geoip_dat ) = ( $ENV{geoip_bin}, $ENV{geoip_dat} );
+
+   if( defined $geoip_bin or defined $geoip_dat ) {
+      unless( -x $geoip_bin ) {
+         print "*** Unable to perform GeoIP lookups: missing geoiplookup binary in $geoip_bin ***\n";
+         undef $geoip_bin;
+      }
+      unless( -e $geoip_dat ) {
+         print "*** Unable to perform GeoIP lookups: missing geoiplookup database in $geoip_dat ***\n";
+         undef $geoip_dat;
+      }
+   }
+
+
+   if( ( $var = $Totals{SMTP} ) ) {
+      my ( $format, $bytes ) = unitize('%', delete $var->{bytes} || 0 );
+
+      print "\n".center('SMTP', '-')."\n";
+
+      print line( delete $var->{connections}, 'Connections');
+      print line( delete $var->{disconnections}, 'Disconnections');
+      print line( delete $var->{messages}, 'Incoming messages');
+      print line( sprintf( $format, $bytes ), 'Incoming bytes');
+
+      if( $var->{auth} ) {
+         print line( delete $var->{auth}{success}, 'Successful authentications') if( $var->{auth}{success} );
+         print line( delete $var->{auth}{failure}, 'Failed authentications') if( $var->{auth}{failure} );
+
+         delete $var->{auth};
+      }
+
+      print line( delete $var->{failure}, 'Transfers failed') if( $var->{failure} );
+
+      delete $Totals{SMTP} unless ( keys $Totals{SMTP} );
+
+   }
+
+   if( ( $var = $Totals{MTA} ) ) {
+      my @arr;
+
+      print "\n".center('MTA', '-')."\n";
+
+      sub print_mta ($$) {
+         my ( $mode, $var ) = @_;
+         my ( $format, $bytes ) = unitize('%', delete $var->{bytes} || 0 );
+         my $ret = "";
+
+         $ret .= line(' ', '--- '.ucfirst($mode).' ---');
+         $ret .= line( delete $var->{success}, sprintf("%-40s %8s", 'Messages transferred', sprintf( $format, $bytes ) ) ) if( $var->{success} );
+         $ret .= line( delete $var->{failure}, 'Transfer attempts failed') if( $var->{failure} );
+         $ret .= line('=', '');
+         $ret .= line( delete $var->{messages}, 'Total transfer attempts') if( $var->{messages} );
+         $ret .= line( duration_to_text( delete $var->{delay} ), 'Max delay');
+
+         return $ret;
+
+      }
+
+      for my $key ( keys $var ) {
+         push @arr, print_mta( $key, $var->{$key} );
+         delete $var->{$key} unless ( keys $var->{$key} );
+      }
+
+      print join "\n", @arr;
+
+      delete $Totals{MTA} unless ( keys $Totals{MTA} );
+
+   }
+
+   if( ( $var = $Totals{MDA} ) ) {
+      my @arr;
+
+      print "\n".center('MDA', '-')."\n";
+
+      if( keys $var ) {
+         sub print_mda ($$) {
+            my ( $method, $var ) = @_;
+            my $ret = "";
+            my ( $format, $bytes ) = unitize('%', delete $var->{bytes} || 0 );
+
+            $ret .= line(' ', '--- '.uc($method).' ---');
+            $ret .= line( delete $var->{success}, sprintf("%-40s %8s", 'Messages delivered', sprintf( $format, $bytes ) ) ) if( $var->{success} );
+            $ret .= line( delete $var->{failure}, 'Delivery attempts failed') if( $var->{failure} );
+            $ret .= line( duration_to_text( delete $var->{delay} ), 'Max delay');
+
+         }
+
+         for my $key ( keys $var ) {
+            push @arr, print_mda( $key, $var->{$key} );
+            delete $var->{$key};
+         }
+      }
+
+      print join "\n", @arr;
+
+      delete $Totals{MDA} unless ( keys $Totals{MDA} );
+
+   }
+
+   if( ( $var = $Counts{SMTP} ) ) {
+      push @ret, count('Connections from', $var, 'hosts', 1 );
+      push @ret, count('Senders', $var, 'senders');
+      push @ret, count('Recipients', $var, 'recipients');
+
+      if( $var->{failure} ) {
+         for my $key ( sort { $a cmp $b } keys $var->{failure} ) {
+            for my $ip ( keys $var->{failure}{$key} ) {
+               $var->{failure}{$key}{ geoip( $geoip_bin, $geoip_dat, $ip ) } = delete $var->{failure}{$key}{$ip};
+            }
+
+            push @ret, count( $key, $var->{failure}, $key, 1 );
+         }
+
+         delete $var->{failure};
+
+      }
+
+      if( $var->{auth} ) {
+         if( $var->{auth}{success} ) {
+            push @ret, count('Authenticated users', $var->{auth}, 'success');
+         }
+
+         if( $var->{auth}{failure} ) {
+            my $failures;
+
+            for my $ip ( sort { ipcmp( $a, $b ) } keys $var->{auth}{failure} ) {
+               my ( $iptotal, $ipstr, $users ) = ( 0, '', $var->{auth}{failure}{$ip} );
+
+               foreach my $k ( sort { $users->{$b} <=> $users->{$a} or $a cmp $b } keys $users ) {
+                  $iptotal += $users->{$k};
+                  $ipstr   .= sprintf("%16s %s\n", $users->{$k}, $k );
+               }
+
+               $failures .= line( $iptotal, geoip( $geoip_bin, $geoip_dat, $ip ) ) . $ipstr;
+
+            }
+
+            push @ret, title('Authentication failures') . $failures;
+
+         }
+
+         delete $var->{auth};
+
+      }
+
+      delete $Counts{SMTP} unless keys $Counts{SMTP};
+
+   }
+
+   if( ( $var = $Counts{MTA} ) ) {
+      for my $destination ( keys $var ) {
+         push @ret, count("Relay to $destination hosts", $var->{$destination}, 'hosts', 1 ) if( $var->{$destination}{hosts} );
+
+         if( $var->{$destination}{recipients} ) {
+            map {
+               my ( $fmt, $size ) = unitize('%', $var->{$destination}{recipients}{$_}{bytes} );
+               my $messages = $var->{$destination}{recipients}{$_}{messages};
+
+               delete $var->{$destination}{recipients}{$_};
+
+               $var->{$destination}{recipients}{ sprintf("%-40s %8s", $_, sprintf( $fmt, $size ) ) } = $messages;
+
+            } keys $var->{$destination}{recipients};
+
+            push @ret, count("Relay to $destination recipients", $var->{$destination}, 'recipients');
+
+         }
+
+         if( $var->{$destination}{failure} ) {
+            for my $key ( sort { $a cmp $b } keys $var->{$destination}{failure} ) {
+               push @ret, count( ucfirst($destination).' relay failed with '.$key, $var->{$destination}{failure}, $key );
+            }
+
+            delete $var->{$destination}{failure};
+
+         }
+
+         delete $var->{$destination} unless keys $var->{$destination};
+      }
+
+      delete $Counts{MTA} unless keys $Counts{MTA};
+
+   }
+
+   if( ( $var = $Counts{MDA} ) ) {
+      for my $method ( sort { $a cmp $b } keys $var ) {
+         if( $var->{$method}{success} ) {
+             map {
+               my ( $fmt, $size ) = unitize('%', $var->{$method}{success}{$_}{bytes} );
+               my $messages = $var->{$method}{success}{$_}{messages};
+
+               delete $var->{$method}{success}{$_};
+
+               $var->{$method}{success}{ sprintf("%-40s %8s", $_, sprintf( $fmt, $size ) ) } = $messages;
+
+            } keys $var->{$method}{success};
+
+            push @ret, count('Local delivery via '.uc($method), $var->{$method}, 'success');
+         }
+
+         if( $var->{$method}{failure} ) {
+            for my $key ( sort { $a cmp $b } keys $var->{$method}{failure} ) {
+               push @ret, count("Local delivery via ".uc($method)." failed with:\n    $key", $var->{$method}{failure}, $key );
+            }
+
+            delete $var->{$method}{failure};
+
+         }
+      }
+
+      delete $Counts{MDA};
+
+   }
+
+   if( $Counts{info} ) {
+      push @ret, count('Info', \%Counts, 'info');
+      delete $Counts{info};
+   }
+
+   if( $Counts{warnings} ) {
+      push @ret, count('Warnings', \%Counts, 'warnings');
+      delete $Counts{warnings};
+   }
+
+   if( @ret ) {
+      print "\n".center('Details', '-')."\n";
+      print join("\n", @ret );
+   }
+
+   print "\nTotals not printed: ".Dumper(%Totals)."\n" if ( keys %Totals );
+   print "\nCounts not printed: ".Dumper(%Counts)."\n" if ( keys %Counts );
+
+}
+
+sub ipcmp($$) {
+   my ( $a, $b ) = @_;
+   return pack('C4' => $a =~ /^$re_IP_strict/) cmp pack('C4' => $b =~ /^$re_IP_strict/ );
+}
+
+sub title($) {
+   my $title = shift;
+   return "  $title:\n";
+}
+
+sub count($$$;$) {
+   my ( $title, $arr, $key, $ip ) = @_;
+   my $var = $arr->{$key};
+   my $ret;
+
+   if( ( $var = $arr->{$key} ) ) {
+      $ret .= title($title);
+
+      foreach my $k ( sort { $var->{$b} <=> $var->{$a} or ( $ip ? ipcmp( $a, $b ) : $a cmp $b ) } keys $var ) {
+         $ret .= line( $var->{$k}, $k );
+      }
+
+      delete $arr->{$key};
+
+   }
+
+   return $ret;
+
+}
+
+print_summary();
+
+#
+# Finally, print any unmatched lines
+#
+if( keys %Unmatched ) {
+   print "\n**Unmatched Entries**\n";
+
+   foreach my $line ( sort { $Unmatched{$b} <=> $Unmatched{$a} } keys %Unmatched ) {
+      printf "   $line: $Unmatched{$line} Time(s)\n";
+   }
+}
+
+# vi: shiftwidth=3 tabstop=3 syntax=perl et
+# Local Variables:
+# mode: perl
+# perl-indent-level: 3
+# indent-tabs-mode: nil
+# End:
