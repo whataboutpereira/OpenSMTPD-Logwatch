@@ -159,8 +159,18 @@ LINE: while ( <> ) {
    }
 
    # Feb 15 13:07:14 localhost smtpd[92675]: delivery: Remove for 56bde0d3348d0ccb: from=<sender@domain.com>, to=<recipient@domain.com>, rcpt=<->, delay=19m54s, stat=Removed by administrator
-   elsif( $service_name eq 'delivery' and ( $p1 =~ /Remove for (?:$re_QID): from=<(?:\S*)>, to=<(?:\S*)>, rcpt=<(?:\S*)>, delay=(?:\S*), stat=(.*)/o ) ) {
+   # May 24 16:56:31 localhost smtpd[91612]: relay: Remove for 618e42094a85f2d4: from=<sender@domain.com>, to=<recipient@domain.com>, rcpt=<->, delay=14m7s, stat=Removed by administrator
+   elsif( ( $service_name eq 'delivery' or $service_name eq 'relay') and ( $p1 =~ /Remove for (?:$re_QID): from=<(\S*)>, to=<(\S*)>, rcpt=<(?:\S*)>, delay=(?:\S*), stat=(.*)/o ) ) {
+       my ( $from, $to ) = ( lc($1), lc($2) );
        $Totals{removed}++;
+       $Counts{removed}{"$from -> $to"}++;
+   }
+
+   # May 24 01:00:27 localhost smtpd[91642]: relay: Expire for ca56014fb7f0bc3f: from=<@>, to=<recipient@domain.com>, rcpt=<->, delay=4d, stat=Envelope expired
+   elsif( $service_name eq 'relay' and ( $p1 =~ /Expire for (?:$re_QID): from=<(\S*)>, to=<(\S*)>, rcpt=<(?:\S*)>, delay=(?:\S*), stat=(.*)/o ) ) {
+       my ( $from, $to ) = ( lc($1), lc($2) );
+       $Totals{expired}++;
+       $Counts{expired}{"$from -> $to"}++;
    }
 
    # Feb 15 13:50:31 localhost smtpd[93928]: warn: queue: no return path!
@@ -391,6 +401,10 @@ sub print_summary() {
       print "*** Unable to access message queue: smtpctl not in $smtpctl ***\n";
    }
 
+   if( $Totals{expired} ) {
+      print line( delete $Totals{expired}, "Expired messages");
+   }
+
    if( $Totals{removed} ) {
       print line( delete $Totals{removed}, "Removed messages");
    }
@@ -568,8 +582,10 @@ sub print_summary() {
          }
 
          if( $var->{$destination}{failure} ) {
+            use Text::Wrap qw( wrap $columns );
+            $columns = 75;
             for my $key ( sort { $a cmp $b } keys $var->{$destination}{failure} ) {
-               push @ret, count( ucfirst($destination).' relay failed with '.$key, $var->{$destination}{failure}, $key );
+               push @ret, count( wrap("", "     ", ucfirst($destination).' relay failed with '.$key ), $var->{$destination}{failure}, $key );
             }
 
             delete $var->{$destination}{failure};
@@ -621,6 +637,16 @@ sub print_summary() {
    if( $Counts{warnings} ) {
       push @ret, count('Warnings', \%Counts, 'warnings');
       delete $Counts{warnings};
+   }
+
+   if( $Counts{expired} ) {
+      push @ret, count('Expired messages', \%Counts, 'expired');
+      delete $Counts{expired};
+   }
+
+   if( $Counts{removed} ) {
+      push @ret, count('Removed messages', \%Counts, 'removed');
+      delete $Counts{removed};
    }
 
    if( @ret ) {
