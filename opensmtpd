@@ -26,7 +26,17 @@ my %Defaults = (
    geoip_path                  => '/usr/bin/geoiplookup',    # path to geoiplookup binary
    subaddress_delimiter        => '+',                       # delimiter used for subaddress extension
    subaddress_strip            => 0,                         # strip the subaddress extension for cleaner logs
-   ignore_local                => 0                          # ignore lines from/to localhost (if mail is relayed through Amavisd etc)
+   ignore_local                => 0,                         # ignore lines from/to localhost (if mail is relayed through Amavisd etc)
+   threshold_connections       => 0,
+   threshold_senders           => 0,
+   threshold_recipients        => 0,
+   threshold_smtp_failures     => 0,
+   threshold_auth              => 0,
+   threshold_auth_failures     => 0,
+   threshold_relay             => 0,
+   threshold_relay_failures    => 0,
+   threshold_delivery          => 0,
+   threshold_delivery_failures => 0
 );
 
 #
@@ -392,7 +402,7 @@ sub print_summary() {
    print line( $var, "OpenSMTPD exited") if ( ( $var = delete $Totals{opensmtpdexit} ) > 0 );
 
    # Print the mail queue.
-   my $smtpctl = $ENV{smtpctl_path} || $Opts{smtpctl_path};
+   my $smtpctl = $Opts{smtpctl_path};
 
    if( -x $smtpctl ) {
       chomp( my $num = `$smtpctl show queue | wc -l`);
@@ -513,9 +523,9 @@ sub print_summary() {
    }
 
    if( ( $var = $Counts{SMTP} ) ) {
-      push @ret, count('Connections from', $var, 'hosts', 1 );
-      push @ret, count('Senders', $var, 'senders');
-      push @ret, count('Recipients', $var, 'recipients');
+      push @ret, count('Connections from', $var, 'hosts', $Opts{threshold_connections}, 1 );
+      push @ret, count('Senders', $var, 'senders', $Opts{threshold_senders} );
+      push @ret, count('Recipients', $var, 'recipients', $Opts{threshold_recipients} );
 
       if( $var->{failure} ) {
          for my $key ( sort { $a cmp $b } keys $var->{failure} ) {
@@ -523,7 +533,7 @@ sub print_summary() {
                $var->{failure}{$key}{ geoip( $geoip_bin, $geoip_dat, $ip ) } = delete $var->{failure}{$key}{$ip};
             }
 
-            push @ret, count( $key, $var->{failure}, $key, 1 );
+            push @ret, count( $key, $var->{failure}, $key, $Opts{threshold_smtp_failures}, 1 );
          }
 
          delete $var->{failure};
@@ -532,25 +542,31 @@ sub print_summary() {
 
       if( $var->{auth} ) {
          if( $var->{auth}{success} ) {
-            push @ret, count('Authenticated users', $var->{auth}, 'success');
+            push @ret, count('Authenticated users', $var->{auth}, 'success', $Opts{threshold_auth} );
          }
 
          if( $var->{auth}{failure} ) {
-            my $failures;
+            my $failures = '';
 
             for my $ip ( sort { ipcmp( $a, $b ) } keys $var->{auth}{failure} ) {
                my ( $iptotal, $ipstr, $users ) = ( 0, '', $var->{auth}{failure}{$ip} );
 
                foreach my $k ( sort { $users->{$b} <=> $users->{$a} or $a cmp $b } keys $users ) {
-                  $iptotal += $users->{$k};
-                  $ipstr   .= sprintf("%16s %s\n", $users->{$k}, $k );
+                  if(  $users->{$k} > $Opts{threshold_auth_failures} ) {
+                     $iptotal += $users->{$k};
+                     $ipstr   .= sprintf("%16s %s\n", $users->{$k}, $k );
+                  }
                }
 
-               $failures .= line( $iptotal, geoip( $geoip_bin, $geoip_dat, $ip ) ) . $ipstr;
+               if( $ipstr ne '') {
+                  $failures .= line( $iptotal, geoip( $geoip_bin, $geoip_dat, $ip ) ) . $ipstr;
+               }
 
             }
 
-            push @ret, title('Authentication failures') . $failures;
+            if( $failures ne '') {
+               push @ret, title('Authentication failures' . ( $Opts{threshold_auth_failures} ? "(threshold of $Opts{threshold_auth_failures})" : "") ) . $failures;
+            }
 
          }
 
@@ -564,7 +580,7 @@ sub print_summary() {
 
    if( ( $var = $Counts{MTA} ) ) {
       for my $destination ( keys $var ) {
-         push @ret, count("Relay to $destination hosts", $var->{$destination}, 'hosts', 1 ) if( $var->{$destination}{hosts} );
+         push @ret, count("Relay to $destination hosts", $var->{$destination}, 'hosts', $Opts{threshold_relay}, 1 ) if( $var->{$destination}{hosts} );
 
          if( $var->{$destination}{recipients} ) {
             map {
@@ -577,7 +593,7 @@ sub print_summary() {
 
             } keys $var->{$destination}{recipients};
 
-            push @ret, count("Relay to $destination recipients", $var->{$destination}, 'recipients');
+            push @ret, count("Relay to $destination recipients", $var->{$destination}, 'recipients', $Opts{threshold_relay} );
 
          }
 
@@ -585,7 +601,7 @@ sub print_summary() {
             use Text::Wrap qw( wrap $columns );
             $columns = 75;
             for my $key ( sort { $a cmp $b } keys $var->{$destination}{failure} ) {
-               push @ret, count( wrap("", "     ", ucfirst($destination).' relay failed with '.$key ), $var->{$destination}{failure}, $key );
+               push @ret, count( wrap("", "     ", ucfirst($destination).' relay failed with '.$key ), $var->{$destination}{failure}, $key, $Opts{threshold_relay_failures} );
             }
 
             delete $var->{$destination}{failure};
@@ -612,12 +628,12 @@ sub print_summary() {
 
             } keys $var->{$method}{success};
 
-            push @ret, count('Local delivery via '.uc($method), $var->{$method}, 'success');
+            push @ret, count('Local delivery via '.uc($method), $var->{$method}, 'success', $Opts{threshold_delivery} );
          }
 
          if( $var->{$method}{failure} ) {
             for my $key ( sort { $a cmp $b } keys $var->{$method}{failure} ) {
-               push @ret, count("Local delivery via ".uc($method)." failed with:\n    $key", $var->{$method}{failure}, $key );
+               push @ret, count("Local delivery via ".uc($method)." failed with:\n    $key", $var->{$method}{failure}, $key, $Opts{threshold_delivery_failures} );
             }
 
             delete $var->{$method}{failure};
@@ -649,6 +665,8 @@ sub print_summary() {
       delete $Counts{removed};
    }
 
+   @ret = grep /\S/, @ret;
+
    if( @ret ) {
       print "\n".center('Details', '-')."\n";
       print join("\n", @ret );
@@ -669,23 +687,25 @@ sub title($) {
    return "  $title:\n";
 }
 
-sub count($$$;$) {
-   my ( $title, $arr, $key, $ip ) = @_;
+sub count($$$;$;$) {
+   my ( $title, $arr, $key, $threshold, $ip ) = @_;
    my $var = $arr->{$key};
    my $ret;
 
-   if( ( $var = $arr->{$key} ) ) {
-      $ret .= title($title);
+   $threshold = 0 unless $threshold;
 
+   if( ( $var = $arr->{$key} ) ) {
       foreach my $k ( sort { $var->{$b} <=> $var->{$a} or ( $ip ? ipcmp( $a, $b ) : $a cmp $b ) } keys $var ) {
-         $ret .= line( $var->{$k}, $k );
+         if( $var->{$k} gt $threshold ) {
+            $ret .= line( $var->{$k}, $k );
+         }
       }
 
       delete $arr->{$key};
 
    }
 
-   return $ret;
+   return $ret ? title( $title . ( $threshold > 0 ? " (threshold of $threshold)" : "") ) . $ret : "";
 
 }
 
