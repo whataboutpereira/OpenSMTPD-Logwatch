@@ -33,6 +33,7 @@ my %Defaults = (
    threshold_smtp_failures     => 0,
    threshold_auth              => 0,
    threshold_auth_failures     => 0,
+   threshold_auth_ip_warning   => 3,
    threshold_relay             => 0,
    threshold_relay_failures    => 0,
    threshold_delivery          => 0,
@@ -220,12 +221,12 @@ LINE: while ( <> ) {
 
             if( $result eq 'ok') {
                $Totals{SMTP}{auth}{success}++;
-               $Counts{SMTP}{auth}{success}{$user}++;
+               $Counts{SMTP}{auth}{success}{$user}{$hostip}++;
             }
 
             elsif( $result eq 'permfail' or $result eq 'tempfail') {
                $Totals{SMTP}{auth}{failure}++;
-               $Counts{SMTP}{auth}{failure}{$hostip}{$user}++;
+               $Counts{SMTP}{auth}{failure}{$user}{$hostip}++;
             }
 
             else {
@@ -542,32 +543,19 @@ sub print_summary() {
 
       if( $var->{auth} ) {
          if( $var->{auth}{success} ) {
-            push @ret, count('Authenticated users', $var->{auth}, 'success', $Opts{threshold_auth} );
+            my $success = auth_summary('Authenticated users', $var->{auth}{success}, $Opts{threshold_auth}, $geoip_bin, $geoip_dat );
+
+            if( $success ) {
+               push @ret, $success;
+            }
          }
 
          if( $var->{auth}{failure} ) {
-            my $failures = '';
+            my $failures = auth_summary('Authentication failures', $var->{auth}{failure}, $Opts{threshold_auth_failures}, $geoip_bin, $geoip_dat );
 
-            for my $ip ( sort { ipcmp( $a, $b ) } keys $var->{auth}{failure} ) {
-               my ( $iptotal, $ipstr, $users ) = ( 0, '', $var->{auth}{failure}{$ip} );
-
-               foreach my $k ( sort { $users->{$b} <=> $users->{$a} or $a cmp $b } keys $users ) {
-                  if(  $users->{$k} > $Opts{threshold_auth_failures} ) {
-                     $iptotal += $users->{$k};
-                     $ipstr   .= sprintf("%16s %s\n", $users->{$k}, $k );
-                  }
-               }
-
-               if( $ipstr ne '') {
-                  $failures .= line( $iptotal, geoip( $geoip_bin, $geoip_dat, $ip ) ) . $ipstr;
-               }
-
+            if( $failures ) {
+               push @ret, $failures;
             }
-
-            if( $failures ne '') {
-               push @ret, title('Authentication failures' . ( $Opts{threshold_auth_failures} ? "(threshold of $Opts{threshold_auth_failures})" : "") ) . $failures;
-            }
-
          }
 
          delete $var->{auth};
@@ -707,6 +695,35 @@ sub count($$$;$;$) {
 
    return $ret ? title( $title . ( $threshold > 0 ? " (threshold of $threshold)" : "") ) . $ret : "";
 
+}
+
+sub auth_summary($$$$$) {
+   my ( $title, $arr, $threshold, $geoip_bin, $geoip_dat ) = @_;
+
+   $threshold = 0 unless $threshold;
+
+   if( $arr ) {
+      my $ret = '';
+
+      foreach my $user ( sort { $arr->{$b} <=> $arr->{$a} or $a cmp $b } keys $arr ) {
+         my ( $iptotal, $ipstr, $ips ) = ( 0, '', $arr->{$user} );
+         my $ipcount = keys $ips;
+
+         for my $ip ( sort { $ips->{$b} <=> $ips->{$a} or ipcmp( $a, $b ) } keys $ips ) {
+            $iptotal += $ips->{$ip};
+            $ipstr   .= sprintf("%16s  %s\n", $ips->{$ip}, geoip( $geoip_bin, $geoip_dat, $ip ) );
+         }
+
+         if( $iptotal > $threshold or $ipcount > $Opts{threshold_auth_ip_warning} ) {
+            $ret .= line( $iptotal, $user . ( $ipcount > $Opts{threshold_auth_ip_warning} ? "\n             *** WARNING! Logins from $ipcount IP addresses (threshold of $Opts{threshold_auth_ip_warning}) ***" : "") ) . $ipstr;
+         }
+      }
+
+      return unless $ret ne '';
+
+      return title( $title . ( $threshold > 0 ? " (threshold of $threshold)" : "") ) . $ret;
+
+   }
 }
 
 print_summary();
