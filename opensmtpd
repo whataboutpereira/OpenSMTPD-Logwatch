@@ -8,10 +8,10 @@ no warnings 'uninitialized';
 
 use Data::Dumper;
 
-my $re_QID     = qr/[a-z\d]+/;
+my $re_QID       = qr/[a-z\d]{8,16}/;
 my $re_IP_strict = qr/\b(25[0-5]|2[0-4]\d|[01]?\d{1,2})\.(25[0-5]|2[0-4]\d|[01]?\d{1,2})\.(25[0-5]|2[0-4]\d|[01]?\d{1,2})\.(25[0-5]|2[0-4]\d|[01]?\d{1,2})\b/;
 
-my ( %Opts, %Queue, %Totals, %Counts, %Unmatched );
+my ( %Opts, %Queue, %Envelopes, %Totals, %Counts, %Unmatched );
 
 # Default values for various options.  These are used
 # to reset default values after an option has been
@@ -76,7 +76,7 @@ sub unitize($$) {
       $num /= $kilobyte;
       $fmt .= '.3fK';
    } else {
-      $fmt .= 'd ';
+      $fmt .= 'd';
    }
 
    return ( $fmt, $num );
@@ -153,7 +153,7 @@ LINE: while ( <> ) {
 
    $origline = $_;
 
-#   print "mailhost: $mailhost, servicename: $service_name, p1: $p1\n";
+   # print "mailhost: $mailhost, servicename: $service_name, p1: $p1\n";
 
    if( $service_name eq 'info') {
       if( $p1 =~ /OpenSMTPD (?:.*) starting$/o ) {
@@ -191,33 +191,50 @@ LINE: while ( <> ) {
        $Counts{warnings}{$p1}++;
    }
 
-   elsif( $p1 =~ /^($re_QID) (smtp|mta|mda) event=(\S+)/o ) {
+   elsif( $p1 =~ /^($re_QID) (smtp|mta|mda) (\S+)/o ) {
       my ( $qid, $protocol, $event ) = ( $1, $2, $3 );
 
-#      print "qid: $qid protocol: $protocol event: $event\n";
+      # print "qid: $qid protocol: $protocol event: $event\n";
 
       if( $protocol eq 'smtp') {
-         # Feb 16 12:34:26 localhost smtpd[1180]: 9db5bf49cce33ff4 smtp event=connected address=192.168.1.3 host=host.domain.com
-         if( $event eq 'connected' and ( $p1 =~ /address=(\S+) host=(?:\S+)/o ) ) {
+         # Aug 30 14:23:34 localhost smtpd[3866]: 26758297e509399d smtp connected address=local host=host.domain.com
+         # Aug 30 14:23:34 localhost smtpd[3866]: 26758297e509399d smtp connected address=127.0.0.1 host=localhost.domain.com
+         # Aug 30 14:23:34 localhost smtpd[3866]: 26758297e509399d smtp connected address=192.168.1.100 host=host.domain.com
+         # address=local means the mail is originating from the host itself.
+         # address=127.0.0.1 means we're receiving from spam filter etc.
+         # We filter the latter out if ignore_local is set in configuration.
+         if( $event eq 'connected' and ( $p1 =~ /address=(\S+) host=(\S+)/o ) ) {
+            $Queue{$qid} = { hostip => $1, hostname => $2, size => 0, tls => 0, cipher => 0 };
+
             next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
+
             $Totals{SMTP}{connections}++;
+
          }
 
-         # Feb 22 12:07:26 localhost smtpd[1196]: 8ae9b04ef67317c9 smtp event=closed address=192.168.1.100 host=host.domain.com reason=quit
-         elsif( $event eq 'closed' and ( $p1 =~ /address=(\S+) host=(?:\S+)/o ) ) {
-            next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
-            $Totals{SMTP}{disconnections}++;
-         }
-
-         # Feb 16 01:22:51 localhost smtpd[98613]: 7903c23b6f7322bf smtp event=starttls address=10.0.8.2 host=10.0.8.2 ciphers="version=TLSv1.2, cipher=ECDHE-RSA-AES256-GCM-SHA384, bits=256"
-         elsif( $event eq 'starttls') {
+         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp tls ciphers=TLSv1.2:ECDHE-RSA-AES256-GCM-SHA384:256
+         elsif( $event eq 'tls' and ( $p1 =~ /ciphers=(\S+):(?:\S+):(?:\d+)/o ) ) {
+            $Queue{$qid}{tls} = $1;
             next;
          }
 
-         # Feb 16 12:18:41 localhost smtpd[100401]: c313604f7684f2ef smtp event=authentication user=sender@domain.com address=192.168.1.100 host=host.domain.com result=ok
-         # Feb 22 12:06:45 localhost smtpd[1196]:   8ae9b04ef67317c9 smtp event=authentication user=sender@domain.com address=192.168.1.100 host=host.domain.com result=permfail
-         elsif( $event eq 'authentication' and ($p1 =~ /user=(\S+) address=(\S+) host=(?:\S+) result=(\S+)/o ) ) {
-            my ( $user, $hostip, $result ) = ( lc($1), $2, $3 );
+         # Aug 30 23:16:04 localhost smtpd[4416]: e2f276e4a679bd8c smtp disconnected reason=quit
+         elsif( $event eq 'disconnected') {
+            if( exists($Queue{$qid}) ) {
+               my $data = delete $Queue{$qid};
+
+               next if ( $Opts{ignore_local} and $data->{hostip} eq '127.0.0.1');
+
+               $Totals{SMTP}{tls}{ $data->{tls} }++;
+            }
+
+            next;
+         }
+
+         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp authentication user=user@domain.com result=ok
+         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp authentication user=user@domain.com result=permfail
+         elsif( $event eq 'authentication' and ( $p1 =~ /user=(\S+) result=(\S+)/o ) ) {
+            my ( $user, $result, $hostip ) = ( lc($1), $2, $Queue{$qid}{hostip} );
 
             if( $result eq 'ok') {
                $Totals{SMTP}{auth}{success}++;
@@ -235,11 +252,17 @@ LINE: while ( <> ) {
             }
          }
 
-         # Feb 16 12:21:37 localhost smtpd[100401]: c313606ebd5ef9cc smtp event=message address=local host=host.domain.com msgid=9c5ede28 from=<> to=<recipient@domain.com> size=15676 ndest=1 proto=ESMTP
-         elsif( $event eq 'message' and ( $p1 =~ /address=(\S+) host=(\S+) msgid=($re_QID) from=<(\S*)> to=<(\S+)> size=(\d+)/o ) ) {
-            my ( $hostip, $host, $qid, $from, $to, $size ) = ( $1, $2, $3, lc($4) || '-', lc($5), $6 || 0 );
+         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp message msgid=4ae29064 size=643 nrcpt=1 proto=ESMTP
+         elsif( $event eq 'message' and ( $p1 =~ /msgid=(?:$re_QID) size=(\d+) nrcpt=(?:\d) proto=(?:\S+)/o ) ) {
+            $Queue{$qid}{size} = $1 || 0;
+         }
 
-            $Queue{$qid} = $size;
+         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp envelope evpid=4ae29064d45a4259 from=<sender@domain.com> to=<recipient@domain.com>
+         elsif( $event eq 'envelope' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)>/o ) ) {
+            my ( $evpid, $from, $to ) = ( $1, $2, lc($3) || '-');
+            my ( $hostip, $hostname, $size ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{hostname}, $Queue{$qid}{size} );
+
+            $Envelopes{$evpid} = $size;
 
             next if ( $Opts{ignore_local} and $hostip eq '127.0.0.1');
 
@@ -248,19 +271,21 @@ LINE: while ( <> ) {
             $Totals{SMTP}{messages}++;
             $Totals{SMTP}{bytes} += $size;
 
-            $Counts{SMTP}{hosts}{"$hostip ($host)"}++;
+            $Counts{SMTP}{hosts}{"$hostip ($hostname)"}++;
             $Counts{SMTP}{senders}{$from}++;
             $Counts{SMTP}{recipients}{$to}++;
+
          }
 
-         # Feb 16 11:59:04 localhost smtpd[100157]: 264a4f5e3d18409d smtp event=failed-command address=127.0.0.1 host=localhost command="RCPT TO:<root@domain.com>" result="550 Invalid recipient"
-         # Feb 22 12:06:45 localhost smtpd[1196]  : 8ae9b04ef67317c9 smtp event=failed-command address=192.168.1.100 host=host.domain.com command="AUTH LOGIN (password)" result="535 Authentication failed"
+         # v6.0.3
          # Feb 14 13:18:37 localhost smtpd[80916]: 0bde80208e1d3799 smtp event=bad-input address=192.168.1.100 host=host.domain.com result="500 5.5.1 Invalid command: Pipelining not supported"
-         elsif( ( $event eq 'failed-command' and ( $p1 =~ /address=(\S+) host=(?:\S+) command="(.*?)" result="(.*?)"/o ) ) or
-            ( $event eq 'bad-input' and ( $p1 =~ /address=(\S+) host=(?:\S+) (?:(.*?))result="(.*?)"/o ) ) ) {
-            my ( $hostip, $command, $result ) = ( $1, $2, $3 );
 
-            next if ( $Opts{ignore_local} and $hostip eq '127.0.0.1');
+         # v6.6.0
+         # Aug 30 14:21:32 localhost smtpd[38664]: 26758291bcd1c704 smtp failed-command command="RCPT TO: <recipient@domain.com>" result="424 4.2.4 Mailing list expansion problem: <recipient@domain.com>"
+         # Aug 30 22:55:42 localhost smtpd[44169]: e2f276dd43237896 smtp failed-command command="AUTH LOGIN (password)" result="535 Authentication failed"
+         elsif( ( $event eq 'failed-command' and ( $p1 =~ /command="(.*?)" result="(.*?)"$/o ) ) or
+            ( $event eq 'bad-input' and ( $p1 =~ /(?:(.*?))result="(.*?)"$/o ) ) ) {
+            my ( $command, $result ) = ( $1, $2 );
 
             # Ignore authentication failures.
             # We already took care of these above.
@@ -278,27 +303,53 @@ LINE: while ( <> ) {
       }
 
       elsif( $protocol eq 'mta') {
-         # Feb 16 12:28:32 localhost smtpd[100401]: c313609bf8bf22f1 mta event=connecting address=lmtp://127.0.0.1:10026 host=localhost
-         # Feb 16 12:28:32 localhost smtpd[100401]: c313609f83342aca mta event=connecting address=tls://192.168.1.3:25 host=host.domain.com
-         # Feb 16 00:50:21 localhost smtpd[98310] : 8cff1f9df20f086f mta event=starttls ciphers=version=TLSv1, cipher=DHE-RSA-AES256-SHA, bits=256
-         # Feb 21 12:44:43 localhost smtpd[1196]  : 8ae9b04554cbb3de mta event=connected
-         # Feb 16 12:28:42 localhost smtpd[100401]: c313609bf8bf22f1 mta event=closed reason=quit messages=1
-         # Mar  2 16:30:30 localhost smtpd[1167]  : 6b45940959e04219 mta event=error reason=IO Error: Connection refused
-         next if $event =~ /^(connecting|starttls|connected|closed|error$)/o;
+         next if $event =~ /^(connected|server-cert-check)$/o;
 
-         # Feb 21 12:44:47 localhost smtpd[1196]  : 8ae9b049c19e0ca4 mta event=delivery evpid=9eac896b26f98149 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="192.168.1.4" relay="192.168.1.3 (host.domain.com)" delay=1s result="Ok" stat="250 ok 1519209887 qp 14505"
-         # Feb 21 12:44:47 localhost smtpd[1196]  : 8ae9b04554cbb3de mta event=delivery evpid=99db4828284334fd from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="127.0.0.1" relay="127.0.0.1 (localhost)" delay=4s result="Ok" stat="250 2.0.0 from MTA(smtp:[127.0.0.1]:10027): 250 2.0.0: 9eac896b Message accepted for delivery"
-         # Feb 16 11:59:05 localhost smtpd[100157]: 264a4f5d1ddad477 mta event=delivery evpid=a5a96f9a72644038 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="127.0.0.1" relay="127.0.0.1 (localhost)" delay=4s result="PermFail" stat="550 5.1.0 id=98534-03 - Rejected by next-hop MTA on relaying, from MTA(smtp:[127.0.0.1]:10025): 550 Invalid recipient"
-         # Mar  2 16:30:41 localhost smtpd[1167]  : 0000000000000000 mta event=delivery evpid=be24f5b86bc1b7f4 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="-" relay="127.0.0.1" delay=11s result="TempFail" stat="Network error on destination MXs"
-         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> rcpt=<(\S+)> source="(\S+)" relay="(\S+)(?:\s\((\S+)\))?" delay=(\S+) result="(\S+)" stat="(.*?)"/o ) ) {
-            my ( $qid, $from, $to, $origto, $source, $relayhostip, $relayhost, $delay, $result, $status ) = ( ( substr $1, 0, 8 ), lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8, $9, $10 );
+         # Aug 30 23:15:48 localhost smtpd[44169]: e2f276e39386ccb3 mta connecting address=smtp://127.0.0.1:10026 host=localhost.domain.com
+         if( $event eq 'connecting' and ( $p1 =~ /address=(?:\S+):\/\/(\S+):(\d+) host=(\S+)/o ) ) {
+            $Queue{$qid} = { hostip => $1, port => $2, hostname => $3, tls => 0, cipher => 0 };
+
+            # print "qid: $qid hostip: $1 port: $2 hostname: $3\n";
+
+            next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
+
+            $Totals{MTA}{connections}++;
+
+         }
+
+         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp tls ciphers=TLSv1.2:ECDHE-RSA-AES256-GCM-SHA384:256
+         elsif( $event eq 'tls' and ( $p1 =~ /ciphers=(\S+):(?:\S+):(?:\d+)/o ) ) {
+            $Queue{$qid}{tls} = $1;
+            next;
+         }
+
+         # Aug 30 11:56:55 localhost smtpd[38664]: 26758286f4235daf mta disconnected reason=quit messages=1
+         # Aug 30 23:15:54 localhost smtpd[44169]: e2f276e7e4266f44 mta error reason=SSL certificate check failed
+         elsif( $event eq 'disconnected' or $event eq 'error') {
+            if( exists($Queue{$qid}) ) {
+               my $data = delete $Queue{$qid};
+
+               next if ( $Opts{ignore_local} and $data->{hostip} eq '127.0.0.1');
+
+               $Totals{MTA}{tls}{ $data->{tls} }++;
+            }
+
+            $Totals{MTA}{failure}++ if( $event eq 'error');
+
+            next;
+         }
+
+         # Aug 30 11:56:45 localhost smtpd[38664]: 26758286f4235daf mta delivery evpid=9d7c6703307fd2a4 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="192.168.1.4" relay="192.168.1.3 (host.domain.com)" delay=0s result="Ok" stat="250 2.0.0: a9f0dc86 Message accepted for delivery"
+         # Aug 29 03:34:13 localhost smtpd[11395]: 9e96d1ea08aa38a1 mta delivery evpid=f746881a7b91cc75 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<recipient@domain.com> source="127.0.0.1" relay="127.0.0.1 (localhost.domain.com)" delay=10s result="Ok" stat="250 2.0.0 from MTA(smtp:[127.0.0.1]:10027): 250 2.0.0 aafc7d2c Message accepted for delivery"
+         elsif( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> rcpt=<(\S+)> source="(\S+)" relay="(\S+)(?:\s\((\S+)\))?" delay=(\S+) result="(\S+)" stat="(.*?)"/o ) ) {
+            my ( $evpid, $from, $to, $origto, $source, $relayhostip, $relayhost, $delay, $result, $status ) = ( $1, lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8, $9, $10 );
+            my $size = delete $Envelopes{$evpid};
 
             # Always display failed local transfers.
             #
             next if ( $Opts{ignore_local} and $relayhostip eq '127.0.0.1' and $result eq 'Ok');
 
             my $destination = ( $relayhostip eq '127.0.0.1') ? 'local' : 'remote';
-            my $size = $Queue{$qid};
 
             $Totals{MTA}{$destination}{messages}++;
             $Counts{MTA}{$destination}{hosts}{"$relayhostip ($relayhost)"}++ if( $destination eq 'remote');
@@ -334,30 +385,28 @@ LINE: while ( <> ) {
       }
 
       elsif( $protocol eq 'mda') {
-         # Feb 22 23:43:47 localhost smtpd[1170]  : 0000000000000000 mda event=delivery evpid=2abff8b46a5614cd from=<sender@domain.com> to=<recipient@domain.com> user=recipient_domain.com method=lmtp delay=0s result=Ok stat=Delivered
-         # Feb 16 12:23:16 localhost smtpd[100401]: 0000000000000000 mda event=delivery evpid=5073be8a28fc935a from=<sender@domain.com> to=<recipient@domain.com> user=recipient_comain.com method=mda delay=0s result=Ok stat=Delivered
-         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> (?:rcpt=<(.*?)>,)?(?:.*) method=(\S+) delay=(\S+) result=(\S+) stat=(.+)/o )) {
-            my ( $qid, $from, $to, $origto, $method, $delay, $result, $status ) = ( substr( $1, 0, 8 ), lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8 );
+         # Aug 30 03:40:03 localhost smtpd[28220]: 1dac3318d674b616 mda delivery evpid=f3e788709da5a0e6 from=<sender@host.com> to=<recipient@host.com> rcpt=<recipient@host.com> user=3 delay=0s result=Ok stat=Delivered
+         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> (?:rcpt=<(.*?)>,)?(?:.*) user=(?:\S+) delay=(\S+) result=(\S+) stat=(.+)/o )) {
+            my ( $evpid, $from, $to, $origto, $delay, $result, $status ) = ( $1, lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8 );
+            my $size = delete $Envelopes{$evpid};
 
-            # print "from: $from to: $to rcpt: $origto method: $method delay: ".$delay."s result: $result status: $status\n";
-
-            my $size = $Queue{$qid};
+            # print "from: $from to: $to rcpt: $origto delay: ".$delay." result: $result status: $status\n";
 
             strip_delimiter( $from, $to );
 
             if( $result eq 'Ok') {
-               $Totals{MDA}{$method}{success}++;
-               $Totals{MDA}{$method}{bytes} += $size;
-               $Counts{MDA}{$method}{success}{$to}{messages}++;
-               $Counts{MDA}{$method}{success}{$to}{bytes} += $size;
+               $Totals{MDA}{success}++;
+               $Totals{MDA}{bytes} += $size;
+               $Counts{MDA}{success}{$to}{messages}++;
+               $Counts{MDA}{success}{$to}{bytes} += $size;
             } else {
-               $Totals{MDA}{$method}{failure}++;
-               $Counts{MDA}{$method}{failure}{$status}{$to}++;
+               $Totals{MDA}{failure}++;
+               $Counts{MDA}{failure}{$status}{$to}++;
             }
 
             $delay = duration_to_seconds($delay);
 
-            $Totals{MDA}{$method}{delay} = $delay unless $Totals{MDA}{$method}{delay} and $Totals{MDA}{$method}{delay} gt $delay;
+            $Totals{MDA}{delay} = $delay unless $Totals{MDA}{delay} and $Totals{MDA}{delay} gt $delay;
 
          } else {
             unmatched();
@@ -372,7 +421,7 @@ LINE: while ( <> ) {
    }
 
    else {
-      next if $p1 =~ /^pony express:/;
+      next if $p1 =~ /^pony express:|commands executed from aliases run with smtpd privileges/;
       unmatched();
       next;
    }
@@ -437,14 +486,19 @@ sub print_summary() {
       }
    }
 
-
    if( ( $var = $Totals{SMTP} ) ) {
       my ( $format, $bytes ) = unitize('%', delete $var->{bytes} || 0 );
 
       print "\n".center('SMTP', '-')."\n";
 
       print line( delete $var->{connections}, 'Connections');
-      print line( delete $var->{disconnections}, 'Disconnections');
+
+      for my $key ( keys $var->{tls} ) {
+         print line( delete $var->{tls}{$key}, $key || "TLS OFF");
+      }
+
+      delete $var->{tls} unless keys $var->{tls};
+
       print line( delete $var->{messages}, 'Incoming messages');
       print line( sprintf( $format, $bytes ), 'Incoming bytes');
 
@@ -465,6 +519,17 @@ sub print_summary() {
       my @arr;
 
       print "\n".center('MTA', '-')."\n";
+
+      print line( delete $var->{connections}, 'Connections');
+      print line( delete $var->{failure}, 'Failures') if( $var->{failure} );
+
+      for my $key ( keys $var->{tls} ) {
+         print line( delete $var->{tls}{$key}, $key || "TLS OFF");
+      }
+
+      delete $var->{tls} unless keys $var->{tls};
+
+      print "\n";
 
       sub print_mta ($$) {
          my ( $mode, $var ) = @_;
@@ -494,32 +559,19 @@ sub print_summary() {
    }
 
    if( ( $var = $Totals{MDA} ) ) {
-      my @arr;
+      my $ret = "";
 
       print "\n".center('MDA', '-')."\n";
 
-      if( keys $var ) {
-         sub print_mda ($$) {
-            my ( $method, $var ) = @_;
-            my $ret = "";
-            my ( $format, $bytes ) = unitize('%', delete $var->{bytes} || 0 );
+      my ( $format, $bytes ) = unitize('%', delete $var->{bytes} || 0 );
 
-            $ret .= line(' ', '--- '.uc($method).' ---');
-            $ret .= line( delete $var->{success}, sprintf("%-40s %8s", 'Messages delivered', sprintf( $format, $bytes ) ) ) if( $var->{success} );
-            $ret .= line( delete $var->{failure}, 'Delivery attempts failed') if( $var->{failure} );
-            $ret .= line( duration_to_text( delete $var->{delay} ), 'Max delay');
+      $ret .= line( delete $var->{success}, sprintf("%-40s %8s", 'Messages delivered', sprintf( $format, $bytes ) ) ) if( $var->{success} );
+      $ret .= line( delete $var->{failure}, 'Delivery attempts failed') if( $var->{failure} );
+      $ret .= line( duration_to_text( delete $var->{delay} ), 'Max delay');
 
-         }
+      print $ret;
 
-         for my $key ( keys $var ) {
-            push @arr, print_mda( $key, $var->{$key} );
-            delete $var->{$key};
-         }
-      }
-
-      print join "\n", @arr;
-
-      delete $Totals{MDA} unless ( keys $Totals{MDA} );
+      delete $Totals{MDA} unless keys $Totals{MDA};
 
    }
 
@@ -604,29 +656,27 @@ sub print_summary() {
    }
 
    if( ( $var = $Counts{MDA} ) ) {
-      for my $method ( sort { $a cmp $b } keys $var ) {
-         if( $var->{$method}{success} ) {
-             map {
-               my ( $fmt, $size ) = unitize('%', $var->{$method}{success}{$_}{bytes} );
-               my $messages = $var->{$method}{success}{$_}{messages};
+      if( $var->{success} ) {
+         map {
+            my ( $fmt, $size ) = unitize('%', $var->{success}{$_}{bytes} );
+            my $messages = $var->{success}{$_}{messages};
 
-               delete $var->{$method}{success}{$_};
+            delete $var->{success}{$_};
 
-               $var->{$method}{success}{ sprintf("%-40s %8s", $_, sprintf( $fmt, $size ) ) } = $messages;
+            $var->{success}{ sprintf("%-40s %8s", $_, sprintf( $fmt, $size ) ) } = $messages;
 
-            } keys $var->{$method}{success};
+         } keys $var->{success};
 
-            push @ret, count('Local delivery via '.uc($method), $var->{$method}, 'success', $Opts{threshold_delivery} );
+         push @ret, count('Local delivery via MDA', $var, 'success', $Opts{threshold_delivery} );
+      }
+
+      if( $var->{failure} ) {
+         for my $key ( sort { $a cmp $b } keys $var->{failure} ) {
+            push @ret, count("Local delivery via MDA failed with:\n    $key", $var->{failure}, $key, $Opts{threshold_delivery_failures} );
          }
 
-         if( $var->{$method}{failure} ) {
-            for my $key ( sort { $a cmp $b } keys $var->{$method}{failure} ) {
-               push @ret, count("Local delivery via ".uc($method)." failed with:\n    $key", $var->{$method}{failure}, $key, $Opts{threshold_delivery_failures} );
-            }
+         delete $var->{failure};
 
-            delete $var->{$method}{failure};
-
-         }
       }
 
       delete $Counts{MDA};
@@ -659,6 +709,9 @@ sub print_summary() {
       print "\n".center('Details', '-')."\n";
       print join("\n", @ret );
    }
+
+   print "\nQueue: ".Dumper(%Queue)."\n" if ( keys %Queue );
+   print "\nEnvelopes: ".Dumper(%Envelopes)."\n" if ( keys %Envelopes );
 
    print "\nTotals not printed: ".Dumper(%Totals)."\n" if ( keys %Totals );
    print "\nCounts not printed: ".Dumper(%Counts)."\n" if ( keys %Counts );
