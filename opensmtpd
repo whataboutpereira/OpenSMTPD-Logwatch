@@ -253,14 +253,25 @@ LINE: while ( <> ) {
          }
 
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp message msgid=4ae29064 size=643 nrcpt=1 proto=ESMTP
-         elsif( $event eq 'message' and ( $p1 =~ /msgid=(?:$re_QID) size=(\d+) nrcpt=(?:\d) proto=(?:\S+)/o ) ) {
-            $Queue{$qid}{size} = $1 || 0;
+         elsif( $event eq 'message' and ( $p1 =~ /msgid=(?:$re_QID) size=(\d+) nrcpt=(\d) proto=(?:\S+)/o ) ) {
+            my ( $size, $messages ) = ( $1 || 0, $2 || 0 );
+            my ( $hostip, $hostname ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{hostname} );
+
+            $Queue{$qid}{size} = $size;
+
+            next if ( $Opts{ignore_local} and $hostip eq '127.0.0.1');
+
+            $Totals{SMTP}{messages} += $messages;
+            $Totals{SMTP}{bytes} += $size;
+
+            $Counts{SMTP}{hosts}{"$hostip ($hostname)"}++;
+
          }
 
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp envelope evpid=4ae29064d45a4259 from=<sender@domain.com> to=<recipient@domain.com>
          elsif( $event eq 'envelope' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)>/o ) ) {
             my ( $evpid, $from, $to ) = ( $1, $2, lc($3) || '-');
-            my ( $hostip, $hostname, $size ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{hostname}, $Queue{$qid}{size} );
+            my ( $hostip, $size ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{size} );
 
             $Envelopes{$evpid} = $size;
 
@@ -268,10 +279,6 @@ LINE: while ( <> ) {
 
             strip_delimiter( $from, $to );
 
-            $Totals{SMTP}{messages}++;
-            $Totals{SMTP}{bytes} += $size;
-
-            $Counts{SMTP}{hosts}{"$hostip ($hostname)"}++;
             $Counts{SMTP}{senders}{$from}++;
             $Counts{SMTP}{recipients}{$to}++;
 
