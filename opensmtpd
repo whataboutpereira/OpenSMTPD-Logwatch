@@ -191,6 +191,11 @@ LINE: while ( <> ) {
        $Counts{warnings}{$p1}++;
    }
 
+   # Sep  2 16:42:20 localhost smtpd[28757]: rule #7 matched: match from any for domain domains rcpt-to recipients => filter_incoming
+   elsif( $service_name eq '' && ( $p1 =~ /(?:rule #(?:\d+) matched: (.*))|no rule matched$/o ) ) {
+      $Counts{SMTP}{rules}{ $1 || '-'}++;
+   }
+
    elsif( $p1 =~ /^($re_QID) (smtp|mta|mda) (\S+)/o ) {
       my ( $qid, $protocol, $event ) = ( $1, $2, $3 );
 
@@ -270,7 +275,7 @@ LINE: while ( <> ) {
 
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp envelope evpid=4ae29064d45a4259 from=<sender@domain.com> to=<recipient@domain.com>
          elsif( $event eq 'envelope' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)>/o ) ) {
-            my ( $evpid, $from, $to ) = ( $1, $2, lc($3) || '-');
+            my ( $evpid, $from, $to ) = ( $1, lc($2) || '-', lc($3) || '-');
             my ( $hostip, $size ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{size} );
 
             $Envelopes{$evpid} = $size;
@@ -584,6 +589,7 @@ sub print_summary() {
 
    if( ( $var = $Counts{SMTP} ) ) {
       push @ret, count('Connections from', $var, 'hosts', $Opts{threshold_connections}, 1 );
+      push @ret, count('Rules matched', $var, 'rules', 0, 1 );
       push @ret, count('Senders', $var, 'senders', $Opts{threshold_senders} );
       push @ret, count('Recipients', $var, 'recipients', $Opts{threshold_recipients} );
 
@@ -695,6 +701,9 @@ sub print_summary() {
       delete $Counts{info};
    }
 
+   $Counts{warnings}{'Unclean queue items (no disconnect logged)'} = keys %Queue if ( keys %Queue );
+   $Counts{warnings}{'Unclean envelopes (no disconnect logged)'} = keys %Envelopes if ( keys %Envelopes );
+
    if( $Counts{warnings} ) {
       push @ret, count('Warnings', \%Counts, 'warnings');
       delete $Counts{warnings};
@@ -717,8 +726,8 @@ sub print_summary() {
       print join("\n", @ret );
    }
 
-   print "\nQueue: ".Dumper(%Queue)."\n" if ( keys %Queue );
-   print "\nEnvelopes: ".Dumper(%Envelopes)."\n" if ( keys %Envelopes );
+   # print "\nQueue: ".Dumper(%Queue)."\n" if ( keys %Queue );
+   # print "\nEnvelopes: ".Dumper(%Envelopes)."\n" if ( keys %Envelopes );
 
    print "\nTotals not printed: ".Dumper(%Totals)."\n" if ( keys %Totals );
    print "\nCounts not printed: ".Dumper(%Counts)."\n" if ( keys %Counts );
