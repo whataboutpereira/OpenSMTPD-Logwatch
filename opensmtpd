@@ -289,9 +289,6 @@ LINE: while ( <> ) {
 
          }
 
-         # v6.0.3
-         # Feb 14 13:18:37 localhost smtpd[80916]: 0bde80208e1d3799 smtp event=bad-input address=192.168.1.100 host=host.domain.com result="500 5.5.1 Invalid command: Pipelining not supported"
-
          # v6.6.0
          # Aug 30 14:21:32 localhost smtpd[38664]: 26758291bcd1c704 smtp failed-command command="RCPT TO: <recipient@domain.com>" result="424 4.2.4 Mailing list expansion problem: <recipient@domain.com>"
          # Aug 30 22:55:42 localhost smtpd[44169]: e2f276dd43237896 smtp failed-command command="AUTH LOGIN (password)" result="535 Authentication failed"
@@ -315,7 +312,7 @@ LINE: while ( <> ) {
       }
 
       elsif( $protocol eq 'mta') {
-         next if $event =~ /^(connected|server-cert-check)$/o;
+         next if $event =~ /^(connected)$/o;
 
          # Aug 30 23:15:48 localhost smtpd[44169]: e2f276e39386ccb3 mta connecting address=smtp://127.0.0.1:10026 host=localhost.domain.com
          if( $event eq 'connecting' and ( $p1 =~ /address=(?:\S+):\/\/(\S+):(\d+) host=(\S+)/o ) ) {
@@ -332,6 +329,15 @@ LINE: while ( <> ) {
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp tls ciphers=TLSv1.2:ECDHE-RSA-AES256-GCM-SHA384:256
          elsif( $event eq 'tls' and ( $p1 =~ /ciphers=(\S+):(?:\S+):(?:\d+)/o ) ) {
             $Queue{$qid}{tls} = $1;
+            next;
+         }
+
+         # Sep  3 10:04:29 orc smtpd[21461]: e50dd49d86fb3509 mta server-cert-check result="success"
+         # Sep  3 10:04:29 orc smtpd[21461]: e50dd49d86fb3509 mta server-cert-check result="failure"
+         elsif( $event eq 'server-cert-check' and ( $p1 =~ /result="(\S+)"/o ) ) {
+            my $result = $1;
+            next if ( $Opts{ignore_local} and $Queue{$qid}->{hostip} eq '127.0.0.1');
+            $Totals{MTA}{tls}{'Server certificate checks failed'}++ if( $result eq 'failure');
             next;
          }
 
