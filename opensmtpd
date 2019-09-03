@@ -145,9 +145,9 @@ LINE: while ( <> ) {
 
    next unless length $_;
 
-   next unless /^[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} ?(\S+) $Opts{syslog_name}(?:\[\d+\]): ?((?:(\S+):)?.*)$/o;
+   next unless /^([A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}) ?(\S+) $Opts{syslog_name}(?:\[\d+\]): ?((?:(\S+):)?.*)$/o;
 
-   my ( $mailhost, $p1, $service_name ) = ( $1, $2, $3 );
+   my ( $date, $mailhost, $p1, $service_name ) = ( $1, $2, $3, $4 );
 
    next if $service_name =~ /^(debug|imsg|io|smtp|filters|transfer|bounce|scheduler|expand|lookup|stat|rules|mproc|ramstat|smtp-out|queue-backend|mda|control)/o;
 
@@ -209,7 +209,7 @@ LINE: while ( <> ) {
          # address=127.0.0.1 means we're receiving from spam filter etc.
          # We filter the latter out if ignore_local is set in configuration.
          if( $event eq 'connected' and ( $p1 =~ /address=(\S+) host=(\S+)/o ) ) {
-            $Queue{$qid} = { hostip => $1, hostname => $2, size => 0, tls => 0, cipher => 0 };
+            $Queue{$qid} = { hostip => $1, hostname => $2, size => 0 };
 
             next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
 
@@ -220,20 +220,6 @@ LINE: while ( <> ) {
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp tls ciphers=TLSv1.2:ECDHE-RSA-AES256-GCM-SHA384:256
          elsif( $event eq 'tls' and ( $p1 =~ /ciphers=(\S+):(?:\S+):(?:\d+)/o ) ) {
             $Queue{$qid}{tls} = $1;
-            next;
-         }
-
-         # Aug 30 23:16:04 localhost smtpd[4416]: e2f276e4a679bd8c smtp disconnected reason=quit
-         elsif( $event eq 'disconnected') {
-            if( exists($Queue{$qid}) ) {
-               my $data = delete $Queue{$qid};
-
-               next if ( $Opts{ignore_local} and $data->{hostip} eq '127.0.0.1');
-
-               $Totals{SMTP}{tls}{ $data->{tls} }++;
-            }
-
-            next;
          }
 
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp authentication user=user@domain.com result=ok
@@ -258,15 +244,15 @@ LINE: while ( <> ) {
          }
 
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp message msgid=4ae29064 size=643 nrcpt=1 proto=ESMTP
-         elsif( $event eq 'message' and ( $p1 =~ /msgid=(?:$re_QID) size=(\d+) nrcpt=(\d) proto=(?:\S+)/o ) ) {
-            my ( $size, $messages ) = ( $1 || 0, $2 || 0 );
-            my ( $hostip, $hostname ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{hostname} );
+         elsif( $event eq 'message' and ( $p1 =~ /msgid=(?:$re_QID) size=(\d+) nrcpt=(?:\d+) proto=(?:\S+)/o ) ) {
+            my ( $hostip, $hostname, $size ) = ( $Queue{$qid}{hostip}, $Queue{$qid}{hostname}, $1 || 0 );
 
             $Queue{$qid}{size} = $size;
 
             next if ( $Opts{ignore_local} and $hostip eq '127.0.0.1');
 
-            $Totals{SMTP}{messages} += $messages;
+            $Totals{SMTP}{messages}++;
+
             $Totals{SMTP}{bytes} += $size;
 
             $Counts{SMTP}{hosts}{"$hostip ($hostname)"}++;
@@ -289,11 +275,12 @@ LINE: while ( <> ) {
 
          }
 
-         # v6.6.0
          # Aug 30 14:21:32 localhost smtpd[38664]: 26758291bcd1c704 smtp failed-command command="RCPT TO: <recipient@domain.com>" result="424 4.2.4 Mailing list expansion problem: <recipient@domain.com>"
          # Aug 30 22:55:42 localhost smtpd[44169]: e2f276dd43237896 smtp failed-command command="AUTH LOGIN (password)" result="535 Authentication failed"
+         # Sep  3 12:23:58 localhost smtpd[21461]: e50dd611bbf724b2 smtp failed-command command="MAIL FROM: <user@domain.com>" result="530 5.5.1 Invalid command: Must issue a STARTTLS command first"
+         # Sep  3 02:01:01 localhost smtpd[21461]: e50dd2eb3c2bb2ab smtp failed-command command="RCPT To:<recipient@domain.com>" result="550 Invalid recipient: <recipient@domain.com>"
          elsif( ( $event eq 'failed-command' and ( $p1 =~ /command="(.*?)" result="(.*?)"$/o ) ) or
-            ( $event eq 'bad-input' and ( $p1 =~ /(?:(.*?))result="(.*?)"$/o ) ) ) {
+                ( $event eq 'bad-input' and ( $p1 =~ /(?:(.*?))result="(.*?)"$/o ) ) ) {
             my ( $command, $result ) = ( $1, $2 );
 
             # Ignore authentication failures.
@@ -301,8 +288,30 @@ LINE: while ( <> ) {
             #
             next if( $result =~ /^535 /);
 
+            if( $result eq '530 5.5.1 Invalid command: Must issue a STARTTLS command first') {
+               $command = uc($1) if( $command =~ /^(MAIL FROM):/i );
+               $Queue{$qid}{tls} = 'TLS/STARTTLS not issued' if( $result eq '530 5.5.1 Invalid command: Must issue a STARTTLS command first');
+            }
+
+            if( $result =~ /^(550 Invalid recipient): <(.*)>$/ ) {
+               ( $result, $command ) = ( $1, $2 );
+            }
+
             $Totals{SMTP}{failure}++;
-            $Counts{SMTP}{failure}{$result}{$1}++;
+
+            $Counts{SMTP}{failure}{$result}{$command}++;
+
+         }
+
+         # Aug 30 23:16:04 localhost smtpd[4416]: e2f276e4a679bd8c smtp disconnected reason=quit
+         elsif( $event eq 'disconnected') {
+            if( exists($Queue{$qid}) ) {
+               my $data = delete $Queue{$qid};
+
+               next if ( $Opts{ignore_local} and $data->{hostip} eq '127.0.0.1');
+
+               $Totals{SMTP}{tls}{ $data->{tls} }++;
+            }
          }
 
          else {
@@ -329,16 +338,17 @@ LINE: while ( <> ) {
          # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp tls ciphers=TLSv1.2:ECDHE-RSA-AES256-GCM-SHA384:256
          elsif( $event eq 'tls' and ( $p1 =~ /ciphers=(\S+):(?:\S+):(?:\d+)/o ) ) {
             $Queue{$qid}{tls} = $1;
-            next;
          }
 
-         # Sep  3 10:04:29 orc smtpd[21461]: e50dd49d86fb3509 mta server-cert-check result="success"
-         # Sep  3 10:04:29 orc smtpd[21461]: e50dd49d86fb3509 mta server-cert-check result="failure"
+         # Sep  3 10:04:29 localhost smtpd[21461]: e50dd49d86fb3509 mta server-cert-check result="success"
+         # Sep  3 10:04:29 localhost smtpd[21461]: e50dd49d86fb3509 mta server-cert-check result="failure"
          elsif( $event eq 'server-cert-check' and ( $p1 =~ /result="(\S+)"/o ) ) {
             my $result = $1;
+
             next if ( $Opts{ignore_local} and $Queue{$qid}->{hostip} eq '127.0.0.1');
+
             $Totals{MTA}{tls}{'Server certificate checks failed'}++ if( $result eq 'failure');
-            next;
+
          }
 
          # Aug 30 11:56:55 localhost smtpd[38664]: 26758286f4235daf mta disconnected reason=quit messages=1
@@ -354,7 +364,6 @@ LINE: while ( <> ) {
 
             $Totals{MTA}{failure}++ if( $event eq 'error');
 
-            next;
          }
 
          # Aug 30 11:56:45 localhost smtpd[38664]: 26758286f4235daf mta delivery evpid=9d7c6703307fd2a4 from=<sender@domain.com> to=<recipient@domain.com> rcpt=<-> source="192.168.1.4" relay="192.168.1.3 (host.domain.com)" delay=0s result="Ok" stat="250 2.0.0: a9f0dc86 Message accepted for delivery"
@@ -511,7 +520,7 @@ sub print_summary() {
 
       print line( delete $var->{connections}, 'Connections');
 
-      for my $key ( keys $var->{tls} ) {
+      for my $key ( sort { $a cmp $b } keys $var->{tls} ) {
          print line( delete $var->{tls}{$key}, $key || "TLS OFF");
       }
 
@@ -541,7 +550,7 @@ sub print_summary() {
       print line( delete $var->{connections}, 'Connections');
       print line( delete $var->{failure}, 'Failures') if( $var->{failure} );
 
-      for my $key ( keys $var->{tls} ) {
+      for my $key ( sort { $a cmp $b } keys $var->{tls} ) {
          print line( delete $var->{tls}{$key}, $key || "TLS OFF");
       }
 
