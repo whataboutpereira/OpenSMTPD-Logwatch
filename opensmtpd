@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-use 5.008;
+use v5.16;
 use strict;
 use warnings;
 use re 'taint';
@@ -147,7 +147,7 @@ LINE: while ( <> ) {
 
    next unless /^([A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}) ?(\S+) $Opts{syslog_name}(?:\[\d+\]): ?((?:(\S+):)?.*)$/o;
 
-   my ( $date, $mailhost, $p1, $service_name ) = ( $1, $2, $3, $4 );
+   my ( $date, $mailhost, $p1, $service_name ) = ( $1, $2, $3, $4 || '');
 
    next if $service_name =~ /^(debug|imsg|io|smtp|filters|transfer|bounce|scheduler|expand|lookup|stat|rules|mproc|ramstat|smtp-out|queue-backend|mda|control)/o;
 
@@ -310,7 +310,7 @@ LINE: while ( <> ) {
 
                next if ( $Opts{ignore_local} and $data->{hostip} eq '127.0.0.1');
 
-               $Totals{SMTP}{tls}{ $data->{tls} }++;
+               $Totals{SMTP}{tls}{ $data->{tls} || 'TLS OFF'}++;
             }
          }
 
@@ -413,7 +413,7 @@ LINE: while ( <> ) {
 
       elsif( $protocol eq 'mda') {
          # Aug 30 03:40:03 localhost smtpd[28220]: 1dac3318d674b616 mda delivery evpid=f3e788709da5a0e6 from=<sender@host.com> to=<recipient@host.com> rcpt=<recipient@host.com> user=3 delay=0s result=Ok stat=Delivered
-         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> (?:rcpt=<(.*?)>,)?(?:.*) user=(?:\S+) delay=(\S+) result=(\S+) stat=(.+)/o )) {
+         if( $event eq 'delivery' and ( $p1 =~ /evpid=($re_QID) from=<(\S*)> to=<(\S+)> rcpt=<(\S+)> user=(?:\S+) delay=(\S+) result=(\S+) stat=(.+)/o )) {
             my ( $evpid, $from, $to, $origto, $delay, $result, $status ) = ( $1, lc($2) || '-', lc($3), lc($4), $5, $6, $7, $8 );
             my $size = delete $Envelopes{$evpid};
 
@@ -520,11 +520,11 @@ sub print_summary() {
 
       print line( delete $var->{connections}, 'Connections');
 
-      for my $key ( sort { $a cmp $b } keys $var->{tls} ) {
-         print line( delete $var->{tls}{$key}, $key || "TLS OFF");
+      for my $key ( sort { $a cmp $b } keys %{ $var->{tls} } ) {
+         print line( delete $var->{tls}{$key}, $key );
       }
 
-      delete $var->{tls} unless keys $var->{tls};
+      delete $var->{tls} unless keys %{ $var->{tls} };
 
       print line( delete $var->{messages}, 'Incoming messages');
       print line( sprintf( $format, $bytes ), 'Incoming bytes');
@@ -538,7 +538,7 @@ sub print_summary() {
 
       print line( delete $var->{failure}, 'Transfers failed') if( $var->{failure} );
 
-      delete $Totals{SMTP} unless ( keys $Totals{SMTP} );
+      delete $Totals{SMTP} unless ( keys %{ $Totals{SMTP} } );
 
    }
 
@@ -550,11 +550,11 @@ sub print_summary() {
       print line( delete $var->{connections}, 'Connections');
       print line( delete $var->{failure}, 'Failures') if( $var->{failure} );
 
-      for my $key ( sort { $a cmp $b } keys $var->{tls} ) {
-         print line( delete $var->{tls}{$key}, $key || "TLS OFF");
+      for my $key ( sort { $a cmp $b } keys %{ $var->{tls} } ) {
+         print line( delete $var->{tls}{$key}, $key );
       }
 
-      delete $var->{tls} unless keys $var->{tls};
+      delete $var->{tls} unless keys %{ $var->{tls} };
 
       print "\n";
 
@@ -574,14 +574,14 @@ sub print_summary() {
 
       }
 
-      for my $key ( keys $var ) {
+      for my $key ( keys %{ $var } ) {
          push @arr, print_mta( $key, $var->{$key} );
-         delete $var->{$key} unless ( keys $var->{$key} );
+         delete $var->{$key} unless ( keys %{ $var->{$key} } );
       }
 
       print join "\n", @arr;
 
-      delete $Totals{MTA} unless ( keys $Totals{MTA} );
+      delete $Totals{MTA} unless ( keys %{ $Totals{MTA} } );
 
    }
 
@@ -598,7 +598,7 @@ sub print_summary() {
 
       print $ret;
 
-      delete $Totals{MDA} unless keys $Totals{MDA};
+      delete $Totals{MDA} unless keys %{ $Totals{MDA} };
 
    }
 
@@ -609,8 +609,8 @@ sub print_summary() {
       push @ret, count('Recipients', $var, 'recipients', $Opts{threshold_recipients} );
 
       if( $var->{failure} ) {
-         for my $key ( sort { $a cmp $b } keys $var->{failure} ) {
-            for my $ip ( keys $var->{failure}{$key} ) {
+         for my $key ( sort { $a cmp $b } keys %{ $var->{failure} } ) {
+            for my $ip ( keys %{ $var->{failure}{$key} } ) {
                $var->{failure}{$key}{ geoip( $geoip_bin, $geoip_dat, $ip ) } = delete $var->{failure}{$key}{$ip};
             }
 
@@ -642,12 +642,12 @@ sub print_summary() {
 
       }
 
-      delete $Counts{SMTP} unless keys $Counts{SMTP};
+      delete $Counts{SMTP} unless keys %{ $Counts{SMTP} };
 
    }
 
    if( ( $var = $Counts{MTA} ) ) {
-      for my $destination ( keys $var ) {
+      for my $destination ( keys %{ $var } ) {
          push @ret, count("Relay to $destination hosts", $var->{$destination}, 'hosts', $Opts{threshold_relay}, 1 ) if( $var->{$destination}{hosts} );
 
          if( $var->{$destination}{recipients} ) {
@@ -659,7 +659,7 @@ sub print_summary() {
 
                $var->{$destination}{recipients}{ sprintf("%-40s %8s", $_, sprintf( $fmt, $size ) ) } = $messages;
 
-            } keys $var->{$destination}{recipients};
+            } keys %{ $var->{$destination}{recipients} };
 
             push @ret, count("Relay to $destination recipients", $var->{$destination}, 'recipients', $Opts{threshold_relay} );
 
@@ -668,7 +668,7 @@ sub print_summary() {
          if( $var->{$destination}{failure} ) {
             use Text::Wrap qw( wrap $columns );
             $columns = 75;
-            for my $key ( sort { $a cmp $b } keys $var->{$destination}{failure} ) {
+            for my $key ( sort { $a cmp $b } keys %{ $var->{$destination}{failure} } ) {
                push @ret, count( wrap("", "     ", ucfirst($destination).' relay failed with '.$key ), $var->{$destination}{failure}, $key, $Opts{threshold_relay_failures} );
             }
 
@@ -676,10 +676,10 @@ sub print_summary() {
 
          }
 
-         delete $var->{$destination} unless keys $var->{$destination};
+         delete $var->{$destination} unless keys %{ $var->{$destination} };
       }
 
-      delete $Counts{MTA} unless keys $Counts{MTA};
+      delete $Counts{MTA} unless keys %{ $Counts{MTA} };
 
    }
 
@@ -693,13 +693,13 @@ sub print_summary() {
 
             $var->{success}{ sprintf("%-40s %8s", $_, sprintf( $fmt, $size ) ) } = $messages;
 
-         } keys $var->{success};
+         } keys %{ $var->{success} };
 
          push @ret, count('Local delivery via MDA', $var, 'success', $Opts{threshold_delivery} );
       }
 
       if( $var->{failure} ) {
-         for my $key ( sort { $a cmp $b } keys $var->{failure} ) {
+         for my $key ( sort { $a cmp $b } keys %{ $var->{failure} } ) {
             push @ret, count("Local delivery via MDA failed with:\n    $key", $var->{failure}, $key, $Opts{threshold_delivery_failures} );
          }
 
@@ -767,7 +767,7 @@ sub count($$$;$;$) {
    $threshold = 0 unless $threshold;
 
    if( ( $var = $arr->{$key} ) ) {
-      foreach my $k ( sort { $var->{$b} <=> $var->{$a} or ( $ip ? ipcmp( $a, $b ) : $a cmp $b ) } keys $var ) {
+      foreach my $k ( sort { $var->{$b} <=> $var->{$a} or ( $ip ? ipcmp( $a, $b ) : $a cmp $b ) } keys %{ $var } ) {
          if( $var->{$k} gt $threshold ) {
             $ret .= line( $var->{$k}, $k );
          }
@@ -789,11 +789,11 @@ sub auth_summary($$$$$) {
    if( $arr ) {
       my $ret = '';
 
-      foreach my $user ( sort { $arr->{$b} <=> $arr->{$a} or $a cmp $b } keys $arr ) {
+      foreach my $user ( sort { $arr->{$b} <=> $arr->{$a} or $a cmp $b } keys %{ $arr } ) {
          my ( $iptotal, $ipstr, $ips ) = ( 0, '', $arr->{$user} );
-         my $ipcount = keys $ips;
+         my $ipcount = keys %{ $ips };
 
-         for my $ip ( sort { $ips->{$b} <=> $ips->{$a} or ipcmp( $a, $b ) } keys $ips ) {
+         for my $ip ( sort { $ips->{$b} <=> $ips->{$a} or ipcmp( $a, $b ) } keys %{ $ips } ) {
             $iptotal += $ips->{$ip};
             $ipstr   .= sprintf("%16s  %s\n", $ips->{$ip}, geoip( $geoip_bin, $geoip_dat, $ip ) );
          }
