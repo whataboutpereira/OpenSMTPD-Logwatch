@@ -291,10 +291,10 @@ LINE: while ( <> ) {
             if( $result eq '530 5.5.1 Invalid command: Must issue a STARTTLS command first') {
                $command = uc($1) if( $command =~ /^(MAIL FROM):/i );
                $Queue{$qid}{tls} = 'TLS/STARTTLS not issued' if( $result eq '530 5.5.1 Invalid command: Must issue a STARTTLS command first');
-            }
-
-            if( $result =~ /^(550 Invalid recipient): <(.*)>$/ ) {
+            } elsif( $result =~ /^(550 Invalid recipient): <(.*)>$/ ) {
                ( $result, $command ) = ( $1, $2 );
+            } elsif( !$command ) {
+               $command = "$Queue{$qid}{hostip} ($Queue{$qid}{hostname})";
             }
 
             $Totals{SMTP}{failure}++;
@@ -335,7 +335,7 @@ LINE: while ( <> ) {
 
          }
 
-         # Aug 30 23:18:15 localhost smtpd[44169]: e2f276e83513040f smtp tls ciphers=TLSv1.2:ECDHE-RSA-AES256-GCM-SHA384:256
+         # Aug 30 23:15:54 localhost smtpd[44169]: e2f276e7e4266f44 mta tls ciphers=TLSv1.3:TLS_AES_256_GCM_SHA384:256
          elsif( $event eq 'tls' and ( $p1 =~ /ciphers=(\S+):(?:\S+):(?:\d+)/o ) ) {
             $Queue{$qid}{tls} = $1;
          }
@@ -353,13 +353,14 @@ LINE: while ( <> ) {
 
          # Aug 30 11:56:55 localhost smtpd[38664]: 26758286f4235daf mta disconnected reason=quit messages=1
          # Aug 30 23:15:54 localhost smtpd[44169]: e2f276e7e4266f44 mta error reason=SSL certificate check failed
+         # Sep  8 21:34:32 localhost smtpd[15821]: 2c04ac5259744e2f mta error reason=IO Error: Connection refused
          elsif( $event eq 'disconnected' or $event eq 'error') {
             if( exists($Queue{$qid}) ) {
                my $data = delete $Queue{$qid};
 
                next if ( $Opts{ignore_local} and $data->{hostip} eq '127.0.0.1');
 
-               $Totals{MTA}{tls}{ $data->{tls} }++;
+               $Totals{MTA}{tls}{ $data->{tls} }++ if( $data->{tls} );
             }
 
             $Totals{MTA}{failure}++ if( $event eq 'error');
