@@ -149,7 +149,7 @@ LINE: while ( <> ) {
 
    my ( $date, $mailhost, $p1, $service_name ) = ( $1, $2, $3, $4 || '');
 
-   next if $service_name =~ /^(debug|imsg|io|smtp|filters|transfer|bounce|scheduler|expand|lookup|stat|rules|mproc|ramstat|smtp-out|queue-backend|mda|control)/o;
+   next if $service_name =~ /^(debug|imsg|io|smtp|filters|transfer|bounce|scheduler|expand|lookup|stat|rules|mproc|ramstat|smtp-out|queue-backend|mda|control|auth-reporter)/o;
 
    $origline = $_;
 
