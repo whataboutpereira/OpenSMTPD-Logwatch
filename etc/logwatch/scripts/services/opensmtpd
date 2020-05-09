@@ -205,10 +205,11 @@ LINE: while ( <> ) {
          # Aug 30 14:23:34 localhost smtpd[3866]: 26758297e509399d smtp connected address=local host=host.domain.com
          # Aug 30 14:23:34 localhost smtpd[3866]: 26758297e509399d smtp connected address=127.0.0.1 host=localhost.domain.com
          # Aug 30 14:23:34 localhost smtpd[3866]: 26758297e509399d smtp connected address=192.168.1.100 host=host.domain.com
+         # May  8 03:49:05 localhost smtpd[2993]: b8c819d495dd4489 smtp connected address=183.195.56.123 host=
          # address=local means the mail is originating from the host itself.
          # address=127.0.0.1 means we're receiving from spam filter etc.
          # We filter the latter out if ignore_local is set in configuration.
-         if( $event eq 'connected' and ( $p1 =~ /address=(\S+) host=(\S+)/o ) ) {
+         if( $event eq 'connected' and ( $p1 =~ /address=(\S+) host=(\S*)/o ) ) {
             $Queue{$qid} = { hostip => $1, hostname => $2, size => 0 };
 
             next if ( $Opts{ignore_local} and $1 eq '127.0.0.1');
