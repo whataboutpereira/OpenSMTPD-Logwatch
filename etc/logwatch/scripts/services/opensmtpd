@@ -352,6 +352,16 @@ LINE: while ( <> ) {
 
          }
 
+         # Sep  3 10:04:29 localhost smtpd[1735]: 90b63f38183914e3 mta ssl_check_name: no match for 'name.mx1.domain.com' in cert
+         elsif( $event eq 'ssl_check_name:' and ( $p1 =~ /no match for '(\S+)' in cert/o ) ) {
+            my $hostname = $1;
+
+            next if ( $Opts{ignore_local} and $Queue{$qid}->{hostip} eq '127.0.0.1');
+
+            $Totals{MTA}{tls}{'No match for hostname in certificate'}++;
+
+         }
+
          # Aug 30 11:56:55 localhost smtpd[38664]: 26758286f4235daf mta disconnected reason=quit messages=1
          # Aug 30 23:15:54 localhost smtpd[44169]: e2f276e7e4266f44 mta error reason=SSL certificate check failed
          # Sep  8 21:34:32 localhost smtpd[15821]: 2c04ac5259744e2f mta error reason=IO Error: Connection refused
