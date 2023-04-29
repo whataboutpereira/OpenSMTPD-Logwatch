@@ -32,6 +32,7 @@ my %Defaults = (
    threshold_recipients         => 0,
    threshold_smtp_failures      => 0,
    threshold_auth               => 0,
+   threshold_auth_failures_ip   => 0,
    threshold_auth_failures_user => 0,
    threshold_auth_ip_warning    => 3,
    threshold_relay              => 0,
@@ -643,7 +644,13 @@ sub print_summary() {
          }
 
          if( $var->{auth}{failure} ) {
-            my $failures = auth_summary_users('Authentication failures', $var->{auth}{failure}, $Opts{threshold_auth_failures}, $geoip_bin, $geoip_dat );
+            my $failures = auth_summary_users('Authentication failures by user', $var->{auth}{failure}, $Opts{threshold_auth_failures_user}, $geoip_bin, $geoip_dat );
+
+            if( $failures ) {
+               push @ret, $failures;
+            }
+
+            $failures = auth_summary_ips('Authentication failures by IP', $var->{auth}{failure}, $Opts{threshold_auth_failures_ip}, $geoip_bin, $geoip_dat );
 
             if( $failures ) {
                push @ret, $failures;
@@ -819,6 +826,43 @@ sub auth_summary_users($$$$$) {
 
          if( $totals{$user} > $threshold or $ipcount > $Opts{threshold_auth_ip_warning} ) {
             $ret .= line( $totals{$user}, $user . ( $ipcount > $Opts{threshold_auth_ip_warning} ? "\n             *** WARNING! Logins from $ipcount IP addresses (threshold of $Opts{threshold_auth_ip_warning}) ***" : "") ) . $ipstr;
+         }
+      }
+
+      return unless $ret ne '';
+
+      return title( $title . ( $threshold > 0 ? " (threshold of $threshold)" : "") ) . $ret;
+
+   }
+}
+
+sub auth_summary_ips($$$$$) {
+   my ( $title, $arr, $threshold, $geoip_bin, $geoip_dat ) = @_;
+
+   $threshold = 0 unless $threshold;
+
+   if( $arr ) {
+      my %ips;
+      my %totals;
+      my $ret = '';
+
+      for my $user ( keys %{ $arr } ) {
+         for my $ip ( keys %{ $arr->{$user} } ) {
+            $ips{$ip}{$user} += $arr->{$user}{$ip};
+            $totals{$ip} += $arr->{$user}{$ip};
+         }
+      }
+
+      for my $ip ( sort { $totals{$b} <=> $totals{$a} or ipcmp( $a, $b ) } keys %ips ) {
+         my $userstr = '';
+         my $users = $ips{$ip};
+
+         for my $user ( sort { $users->{$b} <=> $users->{$a} or $a cmp $b } keys %{ $users } ) {
+            $userstr .= sprintf("%16s  %s\n", $users->{$user}, $user );
+         }
+
+         if( $totals{$ip} > $threshold ) {
+            $ret .= line( $totals{$ip}, geoip( $geoip_bin, $geoip_dat, $ip ) ) . $userstr;
          }
       }
 
