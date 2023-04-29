@@ -19,25 +19,25 @@ my ( %Opts, %Queue, %Envelopes, %Totals, %Counts, %Unmatched );
 # a report to be disabled via config file or --nodetail,
 # but reenabled via subsequent command line option
 my %Defaults = (
-   detail                      => 10,                        # report level detail
-   syslog_name                 => 'smtpd',                   # service name (postconf(5), syslog_name)
-   delays                      => 1,                         # show message delivery delays report
-   smtpctl_path                => '/usr/sbin/smtpctl',       # path to smtpctl binary
-   geoip_path                  => '/usr/bin/geoiplookup',    # path to geoiplookup binary
-   subaddress_delimiter        => '+',                       # delimiter used for subaddress extension
-   subaddress_strip            => 0,                         # strip the subaddress extension for cleaner logs
-   ignore_local                => 0,                         # ignore lines from/to localhost (if mail is relayed through Amavisd etc)
-   threshold_connections       => 0,
-   threshold_senders           => 0,
-   threshold_recipients        => 0,
-   threshold_smtp_failures     => 0,
-   threshold_auth              => 0,
-   threshold_auth_failures     => 0,
-   threshold_auth_ip_warning   => 3,
-   threshold_relay             => 0,
-   threshold_relay_failures    => 0,
-   threshold_delivery          => 0,
-   threshold_delivery_failures => 0
+   detail                       => 10,                        # report level detail
+   syslog_name                  => 'smtpd',                   # service name (postconf(5), syslog_name)
+   delays                       => 1,                         # show message delivery delays report
+   smtpctl_path                 => '/usr/sbin/smtpctl',       # path to smtpctl binary
+   geoip_path                   => '/usr/bin/geoiplookup',    # path to geoiplookup binary
+   subaddress_delimiter         => '+',                       # delimiter used for subaddress extension
+   subaddress_strip             => 0,                         # strip the subaddress extension for cleaner logs
+   ignore_local                 => 0,                         # ignore lines from/to localhost (if mail is relayed through Amavisd etc)
+   threshold_connections        => 0,
+   threshold_senders            => 0,
+   threshold_recipients         => 0,
+   threshold_smtp_failures      => 0,
+   threshold_auth               => 0,
+   threshold_auth_failures_user => 0,
+   threshold_auth_ip_warning    => 3,
+   threshold_relay              => 0,
+   threshold_relay_failures     => 0,
+   threshold_delivery           => 0,
+   threshold_delivery_failures  => 0
 );
 
 #
@@ -635,7 +635,7 @@ sub print_summary() {
 
       if( $var->{auth} ) {
          if( $var->{auth}{success} ) {
-            my $success = auth_summary('Authenticated users', $var->{auth}{success}, $Opts{threshold_auth}, $geoip_bin, $geoip_dat );
+            my $success = auth_summary_users('Authenticated users', $var->{auth}{success}, $Opts{threshold_auth}, $geoip_bin, $geoip_dat );
 
             if( $success ) {
                push @ret, $success;
@@ -643,7 +643,7 @@ sub print_summary() {
          }
 
          if( $var->{auth}{failure} ) {
-            my $failures = auth_summary('Authentication failures', $var->{auth}{failure}, $Opts{threshold_auth_failures}, $geoip_bin, $geoip_dat );
+            my $failures = auth_summary_users('Authentication failures', $var->{auth}{failure}, $Opts{threshold_auth_failures}, $geoip_bin, $geoip_dat );
 
             if( $failures ) {
                push @ret, $failures;
@@ -779,7 +779,7 @@ sub count($$$;$;$) {
    $threshold = 0 unless $threshold;
 
    if( ( $var = $arr->{$key} ) ) {
-      foreach my $k ( sort { $var->{$b} <=> $var->{$a} or ( $ip ? ipcmp( $a, $b ) : $a cmp $b ) } keys %{ $var } ) {
+      for my $k ( sort { $var->{$b} <=> $var->{$a} or ( $ip ? ipcmp( $a, $b ) : $a cmp $b ) } keys %{ $var } ) {
          if( $var->{$k} gt $threshold ) {
             $ret .= line( $var->{$k}, $k );
          }
@@ -793,25 +793,32 @@ sub count($$$;$;$) {
 
 }
 
-sub auth_summary($$$$$) {
+sub auth_summary_users($$$$$) {
    my ( $title, $arr, $threshold, $geoip_bin, $geoip_dat ) = @_;
 
    $threshold = 0 unless $threshold;
 
    if( $arr ) {
+      my %totals;
       my $ret = '';
 
-      foreach my $user ( sort { $arr->{$b} <=> $arr->{$a} or $a cmp $b } keys %{ $arr } ) {
-         my ( $iptotal, $ipstr, $ips ) = ( 0, '', $arr->{$user} );
+      for my $user ( keys %{ $arr } ) {
+         for my $ip ( keys %{ $arr->{$user} } ) {
+            $totals{$user} += $arr->{$user}{$ip};
+         }
+      }
+
+      for my $user ( sort { $totals{$b} <=> $totals{$a} or $a cmp $b } keys %{ $arr } ) {
+         my $ipstr = '';
+         my $ips = $arr->{$user};
          my $ipcount = keys %{ $ips };
 
          for my $ip ( sort { $ips->{$b} <=> $ips->{$a} or ipcmp( $a, $b ) } keys %{ $ips } ) {
-            $iptotal += $ips->{$ip};
             $ipstr   .= sprintf("%16s  %s\n", $ips->{$ip}, geoip( $geoip_bin, $geoip_dat, $ip ) );
          }
 
-         if( $iptotal > $threshold or $ipcount > $Opts{threshold_auth_ip_warning} ) {
-            $ret .= line( $iptotal, $user . ( $ipcount > $Opts{threshold_auth_ip_warning} ? "\n             *** WARNING! Logins from $ipcount IP addresses (threshold of $Opts{threshold_auth_ip_warning}) ***" : "") ) . $ipstr;
+         if( $totals{$user} > $threshold or $ipcount > $Opts{threshold_auth_ip_warning} ) {
+            $ret .= line( $totals{$user}, $user . ( $ipcount > $Opts{threshold_auth_ip_warning} ? "\n             *** WARNING! Logins from $ipcount IP addresses (threshold of $Opts{threshold_auth_ip_warning}) ***" : "") ) . $ipstr;
          }
       }
 
@@ -830,7 +837,7 @@ print_summary();
 if( keys %Unmatched ) {
    print "\n**Unmatched Entries**\n";
 
-   foreach my $line ( sort { $Unmatched{$b} <=> $Unmatched{$a} } keys %Unmatched ) {
+   for my $line ( sort { $Unmatched{$b} <=> $Unmatched{$a} } keys %Unmatched ) {
       printf "   $line: $Unmatched{$line} Time(s)\n";
    }
 }
