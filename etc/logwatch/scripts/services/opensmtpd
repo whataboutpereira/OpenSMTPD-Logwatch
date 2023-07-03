@@ -192,6 +192,18 @@ LINE: while ( <> ) {
        $Counts{warnings}{$p1}++;
    }
 
+   # Ignore rspamd startup log lines.
+   # Jul  2 12:28:16 localhost smtpd[356982]: rspamd: 2023/07/02 12:28:16 reading lines until ready
+   # Jul  2 12:28:16 localhost smtpd[356982]: rspamd: 2023/07/02 12:28:16 reading line scanner
+   # Jul  2 12:40:56 localhost smtpd[357121]: rspamd: 2023/07/02 12:40:56 responding desired filters
+   elsif( $service_name eq 'rspamd' && ( $p1 =~ /\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2} (.*)$/) ) {
+      next if (
+         $1 eq "reading lines until ready" or
+         $1 eq "reading line scanner" or
+         $1 eq "responding desired filters"
+      );
+   }
+
    # Sep  2 16:42:20 localhost smtpd[28757]: rule #7 matched: match from any for domain domains rcpt-to recipients => filter_incoming
    elsif( $service_name eq '' && ( $p1 =~ /(?:rule #(?:\d+) matched: (.*))|no rule matched$/o ) ) {
       $Counts{SMTP}{rules}{ $1 || '-'}++;
@@ -350,6 +362,17 @@ LINE: while ( <> ) {
             next if ( $Opts{ignore_local} and $Queue{$qid}->{hostip} eq '127.0.0.1');
 
             $Totals{MTA}{tls}{'Server certificate checks failed'}++ if( $result eq 'failure');
+
+         }
+
+         # New since v7.3.0:
+         # Jul  2 14:16:20 localhost smtpd[357122]: 9110f5c5581ce027 mta cert-check result="unverified" fingerprint="SHA256:1246e4d0564031a61ebaba03e13b9c0f1c0cb3f98d7154ada99ba8e2bd7de11f"
+         elsif( $event eq 'cert-check' and ( $p1 =~ /result="(\S+)"/o ) ) {
+            my $result = $1;
+
+            next if ( $Opts{ignore_local} and $Queue{$qid}->{hostip} eq '127.0.0.1');
+
+            $Totals{MTA}{tls}{'Server certificates unverified'}++ if( $result eq 'unverified');
 
          }
 
