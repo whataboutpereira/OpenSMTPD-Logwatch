@@ -502,8 +502,20 @@ sub geoip($$$) {
    my ( $bin, $dat, $ip ) = @_;
 
    return $ip unless $bin and $dat;
+   return $ip unless $ip =~ /^$re_IP_strict$/o;
 
-   chomp( my $country = `$bin -f $dat "$ip" | cut -d':' -f2-`);
+   my $country;
+
+   if( open( my $fh, '-|', $bin, '-f', $dat, $ip ) ) {
+      $country = <$fh>;
+      close $fh;
+   }
+
+   return $ip unless defined $country;
+
+   chomp $country;
+
+   $country =~ s/^[^:]*://;
 
    return ( $country =~ /(\S+), (.*)/o ) ? sprintf "%s [%s, %s]", $ip, $1, $2 : $ip;
 }
@@ -905,7 +917,7 @@ if( keys %Unmatched ) {
    print "\n**Unmatched Entries**\n";
 
    for my $line ( sort { $Unmatched{$b} <=> $Unmatched{$a} } keys %Unmatched ) {
-      printf "   $line: $Unmatched{$line} Time(s)\n";
+      printf "   %s: %s Time(s)\n", $line, $Unmatched{$line};
    }
 }
 
